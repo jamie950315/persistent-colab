@@ -1,5 +1,6 @@
 """Verify archive restore, corruption detection and incompatible image handling."""
 import json
+import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -43,6 +44,16 @@ class PersistenceTest(unittest.TestCase):
         self.assertEqual(fresh.read_checkpoint(), {"step": 42})
         self.assertEqual(fresh.run("print('restored interpreter')", capture=True).stdout.strip(),
                          "restored interpreter")
+
+    def test_relative_roots_run_from_workspace_cwd(self):
+        previous = os.getcwd()
+        os.chdir(self.root)
+        try:
+            ws = Workspace("relative", Path("drive"), Path("rt")).prepare()
+        finally:
+            os.chdir(previous)
+        self.assertTrue(ws.root.is_absolute() and ws.python.is_absolute())
+        self.assertEqual(ws.run("print('ok')", capture=True).stdout.strip(), "ok")
 
     def test_corrupt_archive_is_not_accepted_or_marked_ready(self):
         ws = self.workspace

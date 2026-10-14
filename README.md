@@ -90,9 +90,12 @@ data dependencies separately with official `colab upload`.
 `finish` saves the Python environment, flushes/unmounts Drive and releases only
 the named VM after a structured success receipt. Save application checkpoints
 beforehand. A remote Python error, timeout or missing receipt leaves the VM
-running for inspection, even when the official `colab exec` exits zero. A
-timeout can leave remote execution in progress; check `colab status`/`colab log`
-before repeating the command. `flush` only unmounts Drive. `rebuild` explicitly
+running for inspection, even when the official `colab exec` exits zero.
+`--timeout` is a wall-clock limit enforced by the official CLI; it accepts no
+unlimited value. `run` defaults to 86400 seconds (Colab's maximum session
+length) and other commands to 600. A local timeout does not stop the remote
+process: check `colab status` and `colab log -s SESSION` and wait for it to
+finish rather than repeating the command. `flush` only unmounts Drive. `rebuild` explicitly
 reinstalls saved requirements on a fresh changed image.
 
 Generate a self-contained notebook locally without allocating a runtime:

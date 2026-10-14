@@ -96,6 +96,11 @@ class Workspace:
             self.assertEqual(stdout.getvalue().strip(), "literal $(touch nope) apostrophe's")
             self.assertEqual(stderr.getvalue().strip(), 'child stderr')
 
+    def test_run_timeout_defaults_to_session_length(self):
+        run = cli.parser().parse_args(['run', '-s', 'test', '-f', 'job.py'])
+        status = cli.parser().parse_args(['status', '-s', 'test'])
+        self.assertEqual((run.timeout, status.timeout), (86400, 600))
+
     def test_notebook_never_overwrites_existing_file(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / 'notebook.ipynb'

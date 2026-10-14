@@ -56,8 +56,11 @@ def parser():
         command = commands.add_parser(name, help=help_text)
         command.add_argument("-s", "--session", required=True)
         command.add_argument("-p", "--project", type=project_name, default="default")
-        command.add_argument("--timeout", type=positive_timeout, default=600,
-                             help="Official remote execution timeout in seconds (default: 600)")
+        # Official exec has a wall-clock deadline and accepts no unlimited value.
+        # Long jobs default to Colab's maximum session length instead.
+        default_timeout = 86400 if name == "run" else 600
+        command.add_argument("--timeout", type=positive_timeout, default=default_timeout,
+                             help=f"Official remote execution timeout in seconds (default: {default_timeout})")
         if name == "install":
             command.add_argument("packages", nargs="+")
         if name == "run":

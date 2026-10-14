@@ -64,8 +64,9 @@ class Workspace:
         if drive_root is None and not default_drive.is_dir():
             raise RuntimeError("Mount Google Drive before creating a workspace.")
         self.project = project
-        self.root = Path(drive_root or default_drive / "PersistentColab" / "workspaces") / project
-        self.local = Path(local_root or "/content/persistent-colab") / project
+        # Subprocesses run with cwd=self.root, so relative paths must be absolute.
+        self.root = (Path(drive_root or default_drive / "PersistentColab" / "workspaces") / project).resolve()
+        self.local = (Path(local_root or "/content/persistent-colab") / project).resolve()
         self.venv = self.local / ".venv"
         self.python = self.venv / "bin" / "python"
         self.env_dir = self.root / "environment"
