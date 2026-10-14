@@ -14,7 +14,7 @@ import colab_workspace_cli as cli
 
 
 class CliTest(unittest.TestCase):
-    def transport(self, receipt=None, error=False):
+    def transport(self, receipt=None, error=False, mounted=True):
         def run(command):
             source = Path(command[command.index('-f') + 1])
             code = json.loads(source.read_text())['cells'][0]['source']
@@ -26,8 +26,10 @@ class CliTest(unittest.TestCase):
             display_module.display = lambda data, **kw: captured.append(data)
             with patch.dict(sys.modules, {'IPython.display': display_module}):
                 if not error:
-                    with tempfile.TemporaryDirectory() as root:
+                    with tempfile.TemporaryDirectory() as root, \
+                         patch('os.path.ismount', return_value=mounted):
                         replaced = code.replace("Path('/content/drive/MyDrive')", f"Path({root!r})")
+                        replaced = replaced.replace("Path('/mnt/pc')", f"Path({root!r})")
                         exec(replaced, namespace)
             outputs = [{'output_type': 'display_data', 'data': data, 'metadata': {}}
                        for data in captured] if receipt != 'missing' else []
@@ -80,7 +82,7 @@ class CliTest(unittest.TestCase):
             helper = f"""from pathlib import Path
 import sys
 class Workspace:
-    def __init__(self, project):
+    def __init__(self, project, workspaces):
         self.root = Path({root!r})
         self.local = self.root
         self.python = Path(sys.executable)
@@ -100,6 +102,67 @@ class Workspace:
         run = cli.parser().parse_args(['run', '-s', 'test', '-f', 'job.py'])
         status = cli.parser().parse_args(['status', '-s', 'test'])
         self.assertEqual((run.timeout, status.timeout), (86400, 600))
+
+    def test_storage_options_accept_either_position(self):
+        before = cli.parser().parse_args(['--storage', 'rclone', '--mount-point', '/mnt/x', 'status', '-s', 't'])
+        after = cli.parser().parse_args(['status', '-s', 't', '--storage', 'rclone'])
+        default = cli.parser().parse_args(['status', '-s', 't'])
+        self.assertEqual((before.storage, before.mount_point), ('rclone', '/mnt/x'))
+        self.assertEqual((after.storage, after.mount_point), ('rclone', '/mnt/pc'))
+        self.assertEqual(default.storage, 'colab-drive')
+        for bad in ('relative', '/', '/content/drive/x', '/mnt/../etc'):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                cli.parser().parse_args(['--mount-point', bad, 'status', '-s', 't'])
+
+    def test_rclone_status_reads_mounted_workspace(self):
+        args = cli.parser().parse_args(['--storage', 'rclone', 'status', '-s', 'test'])
+        stdout = io.StringIO()
+        with patch('subprocess.run', side_effect=self.transport()), redirect_stdout(stdout):
+            self.assertEqual(cli.execute_remote(args, ['colab']), 0)
+        self.assertTrue(json.loads(stdout.getvalue())['root'].endswith('/workspaces/default'))
+
+    def test_unmounted_rclone_storage_is_failure(self):
+        args = cli.parser().parse_args(['--storage', 'rclone', 'restore', '-s', 'test'])
+        with patch('subprocess.run', side_effect=self.transport(mounted=False)), \
+             redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'not mounted'):
+                cli.execute_remote(args, ['colab'])
+
+    def test_mount_rclone_validates_config_before_remote_action(self):
+        with tempfile.TemporaryDirectory() as root:
+            conf = Path(root) / 'rclone.conf'
+            cases = [(None, 'not found'), ('[other]\ntype = drive\n', 'not defined'),
+                     ('# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nabc', 'Encrypted')]
+            for content, message in cases:
+                if content is not None:
+                    conf.write_text(content)
+                stderr = io.StringIO()
+                with patch('colab_workspace_cli.official_command', return_value=['colab']), \
+                     patch('subprocess.run') as run, redirect_stderr(stderr):
+                    self.assertEqual(cli.main(['mount-rclone', '-s', 't', '--conf', str(conf), '--remote', 'gdrive:PC']), 1)
+                run.assert_not_called()
+                self.assertIn(message, stderr.getvalue())
+                self.assertNotIn('RCLONE_ENCRYPT', stderr.getvalue())
+
+    def test_mount_rclone_uploads_config_and_keeps_it_out_of_exec_code(self):
+        with tempfile.TemporaryDirectory() as root:
+            conf = Path(root) / 'rclone.conf'
+            conf.write_text('[gdrive]\ntype = drive\ntoken = {"refresh_token": "secret-sentinel"}\n')
+            calls = []
+            def run(command, **kwargs):
+                calls.append(command)
+                if command[1] == 'exec':
+                    code = json.loads(Path(command[command.index('-f') + 1]).read_text())['cells'][0]['source']
+                    self.assertNotIn('secret-sentinel', code)
+                    self.assertIn("'gdrive:PersistentColab', '/mnt/data'", code)
+                return subprocess.CompletedProcess(command, 0)
+            with patch('colab_workspace_cli.official_command', return_value=['colab']), \
+                 patch('subprocess.run', side_effect=run), redirect_stderr(io.StringIO()):
+                self.assertEqual(cli.main(['mount-rclone', '-s', 't', '--conf', str(conf),
+                                           '--remote', 'gdrive:PersistentColab', '--mount-point', '/mnt/data']), 1)
+            self.assertEqual([c[1] for c in calls], ['upload', 'exec'])
+            self.assertEqual(calls[0][4], str(conf))
+            self.assertRegex(calls[0][5], r'^/tmp/colab-workspace-[0-9a-f]{32}\.conf$')
 
     def test_notebook_never_overwrites_existing_file(self):
         with tempfile.TemporaryDirectory() as root:

@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
@@ -29,6 +30,47 @@ def positive_timeout(value):
     return number
 
 
+def mount_point(value):
+    path = PurePosixPath(value)
+    if not path.is_absolute() or path == PurePosixPath("/") or ".." in path.parts \
+            or path.is_relative_to("/content/drive") or "\n" in value:
+        raise argparse.ArgumentTypeError("Use an absolute runtime directory outside /content/drive, such as /mnt/pc.")
+    return str(path)
+
+
+def rclone_remote(value):
+    # A named remote from the uploaded config, optionally followed by a path.
+    if not re.fullmatch(r"[A-Za-z0-9_.+@][A-Za-z0-9_.+@ -]*:[^\r\n]*", value):
+        raise argparse.ArgumentTypeError("Use NAME:path with a remote defined in the rclone config, such as gdrive:PersistentColab.")
+    return value
+
+
+def validate_rclone_config(path, remote):
+    """Check the local config without printing any of its contents."""
+    if not path.is_file():
+        raise ValueError(f"rclone config not found: {path}")
+    text = path.read_text()
+    if text.lstrip().startswith("# Encrypted rclone configuration File"):
+        raise ValueError("Encrypted rclone configs need an interactive password; use a dedicated unencrypted config.")
+    config = configparser.ConfigParser(interpolation=None)
+    try:
+        config.read_string(text)
+    except configparser.Error:
+        raise ValueError(f"rclone config could not be parsed: {path}") from None
+    name = remote.split(":", 1)[0]
+    if not config.has_section(name):
+        raise ValueError(f"Remote {name!r} is not defined in {path}.")
+
+
+def storage_arguments(parser, default):
+    parser.add_argument("--storage", choices=("colab-drive", "rclone"),
+                        default="colab-drive" if default else argparse.SUPPRESS,
+                        help="Workspace storage: Colab Drive mount or an rclone mount (default: colab-drive)")
+    parser.add_argument("--mount-point", type=mount_point,
+                        default="/mnt/pc" if default else argparse.SUPPRESS,
+                        help="Runtime rclone mount point (default: /mnt/pc)")
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--version", action="version", version=f"colab-workspace {VERSION}")
@@ -36,6 +78,7 @@ def parser():
     result.add_argument("--auth", choices=("oauth2", "adc"), help="Forward to the official CLI; otherwise preserve its default")
     result.add_argument("--config", help="Official CLI session-state file")
     result.add_argument("--client-oauth-config", help="Official CLI OAuth client configuration")
+    storage_arguments(result, default=True)
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor", help="Check the official CLI version and authenticated sessions (no allocation)")
     notebook = commands.add_parser("notebook", help="Generate a self-contained Colab notebook locally")
@@ -43,6 +86,15 @@ def parser():
     notebook.add_argument("-o", "--output", type=Path, required=True)
     mount = commands.add_parser("mount", help="Run official colab drivemount interactively in your terminal")
     mount.add_argument("-s", "--session", required=True)
+    rclone = commands.add_parser("mount-rclone", help="Upload an rclone config and mount a remote without a TTY")
+    rclone.add_argument("-s", "--session", required=True)
+    rclone.add_argument("--conf", type=Path, default=Path.home() / ".config" / "rclone" / "rclone.conf",
+                        help="Local rclone config to upload (default: ~/.config/rclone/rclone.conf)")
+    rclone.add_argument("--remote", type=rclone_remote, required=True, help="Remote and folder, such as gdrive:PersistentColab")
+    rclone.add_argument("--mount-point", type=mount_point, default=argparse.SUPPRESS,
+                        help="Runtime mount point (default: /mnt/pc)")
+    rclone.add_argument("--timeout", type=positive_timeout, default=600,
+                        help="Official remote execution timeout in seconds (default: 600)")
     for name, help_text in (
         ("restore", "Restore the latest compatible environment on an existing mounted VM"),
         ("install", "Install versioned packages and save the environment"),
@@ -50,10 +102,11 @@ def parser():
         ("save", "Save an immutable environment snapshot"),
         ("status", "Read workspace paths and saved snapshot metadata"),
         ("rebuild", "Explicitly reinstall saved requirements on a fresh changed base image"),
-        ("flush", "Flush and unmount Drive without releasing the VM"),
-        ("finish", "Save, flush Drive, then release this named VM; stop only after success"),
+        ("flush", "Flush and unmount storage without releasing the VM"),
+        ("finish", "Save, flush storage, then release this named VM; stop only after success"),
     ):
         command = commands.add_parser(name, help=help_text)
+        storage_arguments(command, default=False)
         command.add_argument("-s", "--session", required=True)
         command.add_argument("-p", "--project", type=project_name, default="default")
         # Official exec has a wall-clock deadline and accepts no unlimited value.
@@ -85,13 +138,27 @@ def helper_source():
     return Path(persistent_colab.__file__).read_text()
 
 
+def storage_setup(args):
+    if args.command == "mount-rclone":
+        return ""
+    if args.storage == "rclone":
+        return f"""storage = Path({args.mount_point!r})
+if not os.path.ismount(storage):
+    raise RuntimeError('rclone storage is not mounted at ' + str(storage) + '. Run colab-workspace mount-rclone -s SESSION --remote NAME:path first.')
+workspaces = storage / 'workspaces'
+"""
+    return """storage = Path('/content/drive/MyDrive')
+if not storage.is_dir():
+    raise RuntimeError('Drive is not mounted. Run colab-workspace mount -s SESSION in an interactive terminal, mount Drive in the notebook, or use --storage rclone. Mount authorization is required on each new VM.')
+workspaces = storage / 'PersistentColab' / 'workspaces'
+"""
+
+
 def remote_script(args, nonce):
     # Execute inside a function so the user's notebook namespace/imports stay intact.
     setup = """from pathlib import Path
 import json, os, subprocess, sys, tempfile, threading
-if not Path('/content/drive/MyDrive').is_dir():
-    raise RuntimeError('Drive is not mounted. Run colab-workspace mount -s SESSION in an interactive terminal, or mount Drive in the notebook. Mount authorization is required on each new VM.')
-exit_code = 0
+""" + storage_setup(args) + """exit_code = 0
 def stream_process(command, cwd, env=None):
     process = subprocess.Popen(command, cwd=cwd, env=env,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -109,18 +176,23 @@ def stream_process(command, cwd, env=None):
         worker.join()
     return code
 """
+    # Give helper classes their own module-like globals to avoid overwriting user globals.
+    helper = f"namespace = {{'__name__': 'persistent_colab_workspace'}}\nexec({helper_source()!r}, namespace)\n"
     if args.command == "status":
-        operation = f"""root = Path('/content/drive/MyDrive/PersistentColab/workspaces') / {args.project!r}
+        operation = f"""root = workspaces / {args.project!r}
 latest = root / 'environment' / 'latest.json'
-print(json.dumps({{'project': {args.project!r}, 'root': str(root), 'exists': root.is_dir(),
+print(json.dumps({{'project': {args.project!r}, 'storage': {args.storage!r}, 'root': str(root), 'exists': root.is_dir(),
                   'local_python': str(Path('/content/persistent-colab') / {args.project!r} / '.venv/bin/python'),
                   'snapshot': json.loads(latest.read_text()) if latest.exists() else None}}, indent=2))
 """
+    elif args.command == "mount-rclone":
+        operation = helper + f"namespace['mount_rclone']({args.remote!r}, {args.mount_point!r}, {args.staged_config!r})\n"
+    elif args.command == "flush" and args.storage == "rclone":
+        operation = helper + f"namespace['flush_rclone']([workspaces / {args.project!r}])\n"
     elif args.command == "flush":
         operation = "from google.colab import drive\ndrive.flush_and_unmount()\nprint('Drive writes flushed; Drive is unmounted.')\n"
     else:
-        # Give helper classes their own module-like globals to avoid overwriting user globals.
-        operation = f"namespace = {{'__name__': 'persistent_colab_workspace'}}\nexec({helper_source()!r}, namespace)\nws = namespace['Workspace']({args.project!r})\n"
+        operation = helper + f"ws = namespace['Workspace']({args.project!r}, workspaces)\n"
         if args.command == "rebuild":
             operation += "ws.rebuild()\n"
         else:
@@ -222,6 +294,13 @@ def main(argv=None):
                 if result.returncode:
                     return result.returncode
             return 0
+        if args.command == "mount-rclone":
+            # Validate locally before any remote action; contents never enter exec code or logs.
+            validate_rclone_config(args.conf, args.remote)
+            args.staged_config = f"/tmp/colab-workspace-{uuid.uuid4().hex}.conf"
+            upload = subprocess.run(command + ["upload", "-s", args.session, str(args.conf), args.staged_config])
+            if upload.returncode:
+                return upload.returncode
         if args.command == "mount":
             if not sys.stdin.isatty():
                 raise RuntimeError("mount needs an interactive terminal for Google authorization. Mount Drive in the Colab notebook when operating through an agent.")
