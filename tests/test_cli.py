@@ -82,11 +82,11 @@ class CliTest(unittest.TestCase):
             helper = f"""from pathlib import Path
 import sys
 class Workspace:
-    def __init__(self, project, workspaces):
+    def __init__(self, project, workspaces, session=None):
         self.root = Path({root!r})
         self.local = self.root
         self.python = Path(sys.executable)
-    def prepare(self):
+    def prepare(self, **options):
         pass
 """
             args = cli.parser().parse_args(['run', '-s', 'test', '-f', str(path), '--', "literal $(touch nope) apostrophe's"])
@@ -163,6 +163,14 @@ class Workspace:
             self.assertEqual([c[1] for c in calls], ['upload', 'exec'])
             self.assertEqual(calls[0][4], str(conf))
             self.assertRegex(calls[0][5], r'^/tmp/colab-workspace-[0-9a-f]{32}\.conf$')
+
+    def test_prune_is_a_dry_run_unless_confirmed(self):
+        dry = cli.remote_script(cli.parser().parse_args(['prune', '-s', 't', '--keep', '3']), 'n')
+        real = cli.remote_script(cli.parser().parse_args(['prune', '-s', 't', '--keep', '3', '--yes']), 'n')
+        self.assertIn("'default', 3, apply=False)", dry)
+        self.assertIn("'default', 3, apply=True)", real)
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.parser().parse_args(['prune', '-s', 't', '--keep', '0'])
 
     def test_notebook_never_overwrites_existing_file(self):
         with tempfile.TemporaryDirectory() as root:

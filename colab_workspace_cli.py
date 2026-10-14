@@ -71,6 +71,13 @@ def storage_arguments(parser, default):
                         help="Runtime rclone mount point (default: /mnt/pc)")
 
 
+def keep_count(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("Keep at least one snapshot.")
+    return number
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--version", action="version", version=f"colab-workspace {VERSION}")
@@ -102,6 +109,7 @@ def parser():
         ("save", "Save an immutable environment snapshot"),
         ("status", "Read workspace paths and saved snapshot metadata"),
         ("rebuild", "Explicitly reinstall saved requirements on a fresh changed base image"),
+        ("prune", "List old environment snapshots to delete; delete only with --yes"),
         ("flush", "Flush and unmount storage without releasing the VM"),
         ("finish", "Save, flush storage, then release this named VM; stop only after success"),
     ):
@@ -114,6 +122,15 @@ def parser():
         default_timeout = 86400 if name == "run" else 600
         command.add_argument("--timeout", type=positive_timeout, default=default_timeout,
                              help=f"Official remote execution timeout in seconds (default: {default_timeout})")
+        if name in ("restore", "install", "run", "save", "rebuild", "finish"):
+            command.add_argument("--force-unlock", action="store_true",
+                                 help="Take over a workspace lock left by a runtime that no longer exists")
+        if name in ("restore", "install", "run", "save", "finish"):
+            command.add_argument("--allow-base-drift", action="store_true",
+                                 help="Restore despite changed base packages, then require pip check to pass")
+        if name == "prune":
+            command.add_argument("--keep", type=keep_count, required=True, help="Newest snapshots to keep")
+            command.add_argument("--yes", action="store_true", help="Delete instead of a dry run")
         if name == "install":
             command.add_argument("packages", nargs="+")
         if name == "run":
@@ -187,16 +204,18 @@ print(json.dumps({{'project': {args.project!r}, 'storage': {args.storage!r}, 'ro
 """
     elif args.command == "mount-rclone":
         operation = helper + f"namespace['mount_rclone']({args.remote!r}, {args.mount_point!r}, {args.staged_config!r})\n"
+    elif args.command == "prune":
+        operation = helper + f"namespace['prune_snapshots'](workspaces / {args.project!r}, {args.keep!r}, apply={args.yes!r})\n"
     elif args.command == "flush" and args.storage == "rclone":
-        operation = helper + f"namespace['flush_rclone']([workspaces / {args.project!r}])\n"
+        operation = helper + f"namespace['release_lock'](workspaces / {args.project!r})\nnamespace['flush_rclone']([workspaces / {args.project!r}])\n"
     elif args.command == "flush":
-        operation = "from google.colab import drive\ndrive.flush_and_unmount()\nprint('Drive writes flushed; Drive is unmounted.')\n"
+        operation = helper + f"namespace['release_lock'](workspaces / {args.project!r})\nfrom google.colab import drive\ndrive.flush_and_unmount()\nprint('Drive writes flushed; Drive is unmounted.')\n"
     else:
-        operation = helper + f"ws = namespace['Workspace']({args.project!r}, workspaces)\n"
+        operation = helper + f"ws = namespace['Workspace']({args.project!r}, workspaces, session={args.session!r})\n"
         if args.command == "rebuild":
-            operation += "ws.rebuild()\n"
+            operation += f"ws.rebuild(force_unlock={args.force_unlock!r})\n"
         else:
-            operation += "ws.prepare()\n"
+            operation += f"ws.prepare(force_unlock={args.force_unlock!r}, allow_base_drift={args.allow_base_drift!r})\n"
             if args.command == "install":
                 if any(p.startswith("-") for p in args.packages):
                     raise ValueError("Pass package specifications, not pip options.")

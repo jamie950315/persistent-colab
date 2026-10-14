@@ -10,10 +10,12 @@ import platform
 import re
 import shutil
 import site
+import socket
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -52,7 +54,137 @@ def runtime_signature():
         "libc": list(platform.libc_ver()),
         "base_packages_sha256": hashlib.sha256(
             json.dumps(normalized).encode()).hexdigest(),
+        "base_packages": [list(item) for item in normalized],
     }
+
+
+PLATFORM_KEYS = ("python", "machine", "os", "libc")
+
+
+def package_drift(saved, current):
+    """Describe base package differences as sorted 'name: old -> new' lines."""
+    before, after = dict(map(tuple, saved)), dict(map(tuple, current))
+    return [f"{name}: {before.get(name, 'absent')} -> {after.get(name, 'absent')}"
+            for name in sorted(before.keys() | after.keys()) if before.get(name) != after.get(name)]
+
+
+LOCK_HEARTBEAT = 60
+LOCK_STALE = 600
+
+
+def _utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _lock_age(record):
+    heartbeat = datetime.strptime(record["heartbeat_utc"], "%Y-%m-%dT%H:%M:%SZ")
+    return (datetime.now(timezone.utc) - heartbeat.replace(tzinfo=timezone.utc)).total_seconds()
+
+
+def _heartbeat_name(path):
+    return "colab-workspace-lock:" + str(path)
+
+
+def _start_heartbeat(path):
+    name = _heartbeat_name(path)
+    if any(thread.name == name and thread.is_alive() for thread in threading.enumerate()):
+        return
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(LOCK_HEARTBEAT):
+            try:
+                record = json.loads(path.read_text())
+                if record.get("host") != socket.gethostname():
+                    return
+                record.update(heartbeat_utc=_utc(), pid=os.getpid())
+                write_json(path, record)
+            except (OSError, ValueError):
+                # Storage was unmounted or the lock was removed; never recreate it.
+                return
+
+    thread = threading.Thread(target=beat, name=name, daemon=True)
+    thread.stop = stop
+    thread.start()
+
+
+def acquire_lock(root, session=None, force=False):
+    """Claim a workspace for this runtime; detects, but cannot prevent, racing writers."""
+    path = Path(root) / "environment" / "LOCK"
+    host = socket.gethostname()
+    record = {"session": session, "host": host, "pid": os.getpid(),
+              "created_utc": _utc(), "heartbeat_utc": _utc()}
+    try:
+        with path.open("xb") as stream:
+            stream.write(json.dumps(record, indent=2).encode() + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        try:
+            current = json.loads(path.read_text())
+        except (OSError, ValueError):
+            current = None
+        if not force and (current is None or current.get("host") != host):
+            if current is None:
+                raise RuntimeError(f"Unreadable workspace lock {path}. Retry with --force-unlock "
+                                   "(notebook: ws.prepare(force_unlock=True)) if no runtime uses it.") from None
+            age = _lock_age(current)
+            owner = f"session {current.get('session')!r} on host {current.get('host')!r}"
+            if age > LOCK_STALE:
+                raise RuntimeError(f"Workspace lock held by {owner} is stale (no heartbeat for {age / 60:.0f} min). "
+                                   "If that runtime is gone, retry with --force-unlock "
+                                   "(notebook: ws.prepare(force_unlock=True)).") from None
+            raise RuntimeError(f"Workspace is in use by {owner} (heartbeat {age:.0f}s ago). "
+                               "Use one writer per project; finish or flush the other runtime first.") from None
+        if current and current.get("host") == host:
+            record["created_utc"] = current.get("created_utc", record["created_utc"])
+        write_json(path, record)
+    _start_heartbeat(path)
+    return path
+
+
+def lock_held_elsewhere(root):
+    path = Path(root) / "environment" / "LOCK"
+    try:
+        return json.loads(path.read_text()).get("host") != socket.gethostname()
+    except FileNotFoundError:
+        return False
+    except ValueError:
+        return True
+
+
+def release_lock(root):
+    """Stop the heartbeat and remove this runtime's lock before storage is flushed."""
+    path = Path(root) / "environment" / "LOCK"
+    for thread in threading.enumerate():
+        if thread.name == _heartbeat_name(path):
+            thread.stop.set()
+            thread.join()
+    if path.exists() and not lock_held_elsewhere(root):
+        path.unlink()
+
+
+def prune_snapshots(root, keep, apply=False):
+    """Remove old snapshot pairs, always keeping the newest ones and the latest pointer."""
+    if keep < 1:
+        raise ValueError("keep must be at least 1.")
+    snapshots = Path(root) / "environment" / "snapshots"
+    latest = Path(root) / "environment" / "latest.json"
+    current = json.loads(latest.read_text())["created_utc"] if latest.exists() else None
+    stamps = sorted({path.name.split(".", 1)[0] for path in snapshots.iterdir()
+                     if path.name.endswith((".tar.gz", ".json"))}, reverse=True)
+    retained = set(stamps[:keep]) | {current}
+    removed = [stamp for stamp in stamps if stamp not in retained]
+    for stamp in removed:
+        for path in (snapshots / (stamp + ".tar.gz"), snapshots / (stamp + ".json")):
+            if path.exists():
+                print(("Deleted " if apply else "Would delete ") + str(path))
+                if apply:
+                    path.unlink()
+    print(f"Kept {len(stamps) - len(removed)} snapshot(s); {'deleted' if apply else 'would delete'} {len(removed)}.")
+    if removed and not apply:
+        print("Dry run only. Repeat with --yes to delete.")
+    return removed
 
 
 RCLONE_CONF = Path("/root/.config/rclone/rclone.conf")
@@ -217,13 +349,14 @@ def flush_rclone(workspace_roots=(), timeout=1800, poll=2):
 class Workspace:
     """Use durable files on Drive and executable packages on the current VM."""
 
-    def __init__(self, project="default", drive_root=None, local_root=None):
+    def __init__(self, project="default", drive_root=None, local_root=None, session=None):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", project):
             raise ValueError("Project must use letters, digits, underscores or hyphens.")
         default_drive = Path("/content/drive/MyDrive")
         if drive_root is None and not default_drive.is_dir():
             raise RuntimeError("Mount Google Drive before creating a workspace.")
         self.project = project
+        self.session = session
         # Subprocesses run with cwd=self.root, so relative paths must be absolute.
         self.root = (Path(drive_root or default_drive / "PersistentColab" / "workspaces") / project).resolve()
         self.local = (Path(local_root or "/content/persistent-colab") / project).resolve()
@@ -242,19 +375,47 @@ class Workspace:
         os.environ["HF_TOKEN_PATH"] = str(self.local / "hf-token")
         os.environ["TORCH_HOME"] = str(self.root / "models" / "torch")
 
-    def prepare(self, restore=True):
-        """Recreate executable paths and restore the latest compatible snapshot."""
+    def prepare(self, restore=True, force_unlock=False, allow_base_drift=False):
+        """Claim the workspace, recreate executable paths and restore the latest compatible snapshot."""
+        acquire_lock(self.root, self.session, force_unlock)
+        try:
+            return self._prepare(restore, allow_base_drift)
+        except BaseException:
+            release_lock(self.root)
+            raise
+
+    def _compatibility(self, saved, allow_base_drift):
+        """Return base package drift accepted for this restore, or raise."""
+        rebuild = ("Review environment/latest.json, then explicitly run ws.rebuild() to "
+                   "reinstall the saved requirements on this image. Old snapshots are kept.")
+        if any(saved.get(key) != self.signature.get(key) for key in PLATFORM_KEYS):
+            raise RuntimeError("The Colab Python/base image changed (Python, architecture or libc). "
+                               "The saved environment was not loaded. " + rebuild)
+        if saved.get("base_packages_sha256") == self.signature.get("base_packages_sha256"):
+            return []
+        if "base_packages" not in saved:
+            raise RuntimeError("The Colab Python/base image changed. The saved environment was not loaded. " + rebuild)
+        drift = package_drift(saved["base_packages"], self.signature["base_packages"])
+        if not allow_base_drift:
+            raise RuntimeError("The Colab base image changed; the saved environment was not loaded. "
+                               "Changed base packages:\n  " + "\n  ".join(drift) +
+                               "\nRetry with allow_base_drift=True (CLI: --allow-base-drift) to restore and "
+                               "validate it with pip check, or " + rebuild)
+        print("Base packages differ from the snapshot:\n  " + "\n  ".join(drift))
+        return drift
+
+    def _dependency_problems(self, python):
+        result = subprocess.run([str(python), "-m", "pip", "check"], capture_output=True, text=True)
+        return set(result.stdout.splitlines()) if result.returncode else set()
+
+    def _prepare(self, restore, allow_base_drift):
         ready = self.local / "environment-ready.json"
         if self.python.exists():
             if ready.exists() and json.loads(ready.read_text()) == self.signature:
                 return self
             raise RuntimeError("Incomplete local environment. Start a fresh runtime to restore safely.")
         snapshot = json.loads(self.latest.read_text()) if restore and self.latest.exists() else None
-        if snapshot and snapshot["runtime"] != self.signature:
-            raise RuntimeError(
-                "The Colab Python/base image changed. The saved environment was not loaded. "
-                "Review environment/latest.json, then explicitly run ws.rebuild() to "
-                "reinstall the saved requirements on this image. Old snapshots are kept.")
+        drift = self._compatibility(snapshot["runtime"], allow_base_drift) if snapshot else []
         if snapshot and snapshot["local_path"] != str(self.venv):
             raise RuntimeError("Snapshot executable paths differ. Use the original project name and runtime path.")
         # Colab's image has pip but its ensurepip bootstrap is unavailable.
@@ -281,6 +442,14 @@ class Workspace:
                 raise
             finally:
                 local_archive.unlink(missing_ok=True)
+            if drift:
+                # Colab images already ship some unmet requirements; only new ones fail.
+                problems = self._dependency_problems(self.python) - self._dependency_problems(sys.executable)
+                if problems:
+                    shutil.rmtree(self.venv)
+                    raise RuntimeError("Restored environment conflicts with the new base image; it was removed:\n  "
+                                       + "\n  ".join(sorted(problems)))
+                print("pip check found no new conflicts with the changed base image.")
             print("Restored Python environment:", archive_name)
         else:
             print("Created a new Python environment; Colab base packages are available.")
@@ -307,6 +476,8 @@ class Workspace:
         """Commit an immutable archive, publishing the pointer only after readback."""
         if not self.python.exists():
             raise RuntimeError("Run ws.prepare() first.")
+        if lock_held_elsewhere(self.root):
+            raise RuntimeError("Another runtime holds this workspace's lock; the environment was not saved.")
         requirements = subprocess.check_output(
             [str(self.python), "-m", "pip", "freeze", "--local"], text=True)
         # Do not persist credentials embedded in installation URLs.
@@ -339,7 +510,7 @@ class Workspace:
                 os.fsync(target.fileno())
             if sha256(destination) != expected:
                 raise RuntimeError("Drive snapshot readback failed; previous snapshot remains current.")
-        snapshot = {"schema": 1, "archive": name, "sha256": expected,
+        snapshot = {"schema": 2, "archive": name, "sha256": expected,
                     "created_utc": stamp, "runtime": self.signature,
                     "requirements": requirements, "local_path": str(self.venv)}
         write_json(self.snapshots / (stamp + ".json"), snapshot)
@@ -347,14 +518,14 @@ class Workspace:
         print("Environment saved and checksum verified:", name)
         return snapshot
 
-    def rebuild(self):
+    def rebuild(self, force_unlock=False):
         """Explicitly reinstall recorded packages when Colab's base image changed."""
         if self.activated:
             raise RuntimeError("Restart the kernel before rebuilding an activated environment.")
         previous = json.loads(self.latest.read_text())
         if self.venv.exists():
             raise RuntimeError("Use a fresh runtime for rebuilding; current environment is preserved.")
-        self.prepare(restore=False)
+        self.prepare(restore=False, force_unlock=force_unlock)
         lock = self.local / "requirements.txt"
         lock.write_text(previous["requirements"])
         if previous["requirements"].strip():
@@ -392,6 +563,7 @@ class Workspace:
 
     def flush(self):
         """Flush storage writes before the user releases the VM."""
+        release_lock(self.root)
         state = rclone_state()
         if state and self.root.is_relative_to(Path(state["mount_point"]).resolve()):
             flush_rclone([self.root])
