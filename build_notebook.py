@@ -67,19 +67,22 @@ print('Saved at:', saved_environment['created_utc'])
 """),
     cell("markdown", """## Before releasing compute
 
-Run the next cell **only when finished**. It flushes and unmounts Drive. Then disconnect and delete the runtime using the Runtime menu. To continue working after unmounting, mount Drive again.
+Check **FLUSH_DRIVE** and run the next cell **only when finished**. It flushes and unmounts Drive. Then disconnect and delete the runtime using the Runtime menu. To continue working after unmounting, mount Drive again.
 
 If Colab reports that its Python/base image changed, restart with a fresh runtime, run cell 1 and instantiate `ws` using cell 2; after the compatibility error, run `ws.rebuild()` and `ws.activate()` in a separate cell. This explicitly reinstalls the recorded package versions and saves a new snapshot; previous snapshots remain on Drive. Reinstallation can fail when a package no longer supports the new image.
 """),
     cell("code", """# @title Flush Drive (run manually when finished)
-# Uncomment when you are ready to release the runtime.
-# ws.flush()
+FLUSH_DRIVE = False  # @param {type:"boolean"}
+if FLUSH_DRIVE:
+    ws.flush()
+else:
+    print('Check FLUSH_DRIVE and run this cell when you are finished.')
 """),
 ]
 for index, item in enumerate(cells):
     item["id"] = f"persistent-colab-{index}"
     item["metadata"]["id"] = item["id"]
-    if item["cell_type"] == "code":
+    if index in (1, 2, 7, 9):
         item["metadata"]["cellView"] = "form"
 
 notebook = {"nbformat": 4, "nbformat_minor": 5,

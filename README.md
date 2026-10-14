@@ -11,7 +11,7 @@ last saved Python environment into a new runtime.
 3. Keep the same `PROJECT` name to continue the same workspace.
 4. Write durable files under `ws.root`. Install packages using `ws.install(...)`.
 5. Save application/model checkpoints during long jobs.
-6. Run **Save environment**, then uncomment and run **Flush Drive** when finished.
+6. Run **Save environment**, check **FLUSH_DRIVE**, then run **Flush Drive** when finished.
 7. Use **Runtime → Disconnect and delete runtime**. Reopen and run steps 1–2
    next time; hardware can be selected separately from the saved workspace.
 
