@@ -28,7 +28,7 @@ from google.colab import drive
 drive.mount('/content/drive')
 """),
     cell("code", "# @title 2. Restore workspace and Python environment\n" +
-         "PROJECT = 'default'  # Use the same name every time; separate names isolate projects.\n" +
+         "PROJECT = 'default'  # @param {type:\"string\"}\n" +
          "exec(" + repr((ROOT / "persistent_colab.py").read_text()) + ")\n" +
          "ws = Workspace(PROJECT)\nws.prepare()\nws.activate()\n" +
          "print('Previous saved state:', ws.read_checkpoint())\n"),
@@ -76,6 +76,12 @@ If Colab reports that its Python/base image changed, restart with a fresh runtim
 # ws.flush()
 """),
 ]
+for index, item in enumerate(cells):
+    item["id"] = f"persistent-colab-{index}"
+    item["metadata"]["id"] = item["id"]
+    if item["cell_type"] == "code":
+        item["metadata"]["cellView"] = "form"
+
 notebook = {"nbformat": 4, "nbformat_minor": 5,
             "metadata": {"colab": {"name": "PersistentColab.ipynb", "provenance": [],
                                     "private_outputs": True},
