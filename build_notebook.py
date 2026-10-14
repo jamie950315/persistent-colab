@@ -67,9 +67,11 @@ print('Saved at:', saved_environment['created_utc'])
 """),
     cell("markdown", """## Before releasing compute
 
-Check **FLUSH_DRIVE** and run the next cell **only when finished**. It flushes and unmounts Drive. Then disconnect and delete the runtime using the Runtime menu. To continue working after unmounting, mount Drive again.
+Check **FLUSH_DRIVE** and run the next cell **only when finished**. It releases the workspace lock, then flushes and unmounts Drive. Then disconnect and delete the runtime using the Runtime menu. To continue working after unmounting, mount Drive again.
 
-If Colab reports that its Python/base image changed, restart with a fresh runtime, run cell 1 and instantiate `ws` using cell 2; after the compatibility error, run `ws.rebuild()` and `ws.activate()` in a separate cell. This explicitly reinstalls the recorded package versions and saves a new snapshot; previous snapshots remain on Drive. Reinstallation can fail when a package no longer supports the new image.
+If Colab reports that its Python/base image changed, restart with a fresh runtime, run cell 1 and instantiate `ws` using cell 2; after the compatibility error, run `ws.rebuild()` and `ws.activate()` in a separate cell. This explicitly reinstalls the recorded package versions and saves a new snapshot; previous snapshots remain on Drive. Reinstallation can fail when a package no longer supports the new image. When only base packages changed, `ws.prepare(allow_base_drift=True)` restores the saved environment instead and removes it again if `pip check` reports a new conflict. CPU and GPU runtimes use different base images.
+
+Cell 2 claims the workspace for this runtime. If another runtime ended without flushing, the error reports a stale lock after 10 minutes; once you are sure that runtime is gone, use `ws.prepare(force_unlock=True)`.
 """),
     cell("code", """# @title Flush Drive (run manually when finished)
 FLUSH_DRIVE = False  # @param {type:"boolean"}

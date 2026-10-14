@@ -18,7 +18,8 @@ process alive.
 - The private Drive deployment is in `My Drive/PersistentColab` and contains
   the notebook, helper and README. Update existing files rather than duplicating
   the deployment; preserve notebook sharing and private-output settings.
-- Persistent root: `/content/drive/MyDrive/PersistentColab/workspaces/<project>`.
+- Persistent root: `/content/drive/MyDrive/PersistentColab/workspaces/<project>`,
+  or `<mount-point>/workspaces/<project>` with `--storage rclone`.
 - Runtime environment: `/content/persistent-colab/<project>/.venv`.
 - Use a CPU runtime for setup/verification; request a GPU only for GPU work.
 - Keep credentials and private runtime/Drive metadata out of Git.
@@ -40,6 +41,15 @@ process alive.
 - Remote commands use temporary notebooks and structured success receipts:
   official `colab exec` 0.7.4 can return zero after a remote Python error.
   `finish` must not stop a runtime until save and Drive flush confirm success.
+- rclone backend (verified on a real CPU VM with an alias remote, not yet with
+  Google Drive): Colab ships FUSE 2 only, so a `fusermount3` shim is needed;
+  the mount must start in a new session or a kernel restart unmounts it.
+  `/tmp` upload paths are absolute (the Jupyter root is `/`). Writing into an
+  unmounted mount point silently writes to VM disk; always check mounts first.
+  Config contents must never enter exec code: `colab log` stores it.
+- Official `exec --timeout` is a wall-clock deadline; 0 and `inf` do not work.
+- Colab CPU and T4 base images differ (648 vs 723 packages, different Python
+  patch). The base image already fails `pip check` (ipython/jedi).
 - Public repository: `https://github.com/jamie950315/persistent-colab`, branch `main`.
 - Install from a local checkout with `uv tool install --editable .`.
   Installed skill directories in `~/.codex/skills` link to the tracked `skills/`.
