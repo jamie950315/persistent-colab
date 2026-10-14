@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "colab-workspace"
+version = "0.1.0"
+description = "Drive-backed Python workspaces alongside the official Google Colab CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+
+[project.scripts]
+colab-workspace = "colab_workspace_cli:main"
+
+[tool.setuptools]
+py-modules = ["colab_workspace_cli", "persistent_colab"]

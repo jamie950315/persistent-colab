@@ -54,6 +54,58 @@ projects to avoid already imported modules carrying over. All projects remain
 accessible to the same Drive account; separate directories are not a security
 boundary.
 
+## Companion CLI and skills
+
+Install the companion alongside the official CLI:
+
+```sh
+uv tool install google-colab-cli  # Skip if already installed.
+uv tool install --editable /path/to/persistent-colab
+colab-workspace doctor
+```
+
+The companion calls the official `colab` executable; it does not replace its
+authentication, session state or runtime management. Global `--auth`, `--config`
+and `--client-oauth-config` options are forwarded when provided. Otherwise the
+official CLI's defaults remain in effect.
+
+```sh
+colab new -s development                    # CPU; use --gpu only when needed.
+colab-workspace mount -s development        # Interactive terminal authorization.
+colab-workspace restore -s development -p default
+colab-workspace install -s development -p default 'humanize==4.15.0'
+colab-workspace run -s development -p default -f job.py -- input.csv
+colab-workspace status -s development -p default
+colab-workspace save -s development -p default
+colab-workspace finish -s development -p default
+```
+
+`run` uses an independent workspace Python process, passes script arguments and
+its exit code, and sets the durable workspace as cwd. Imports can use `src/` and
+the workspace root. Only the specified script is transferred; upload source or
+data dependencies separately with official `colab upload`.
+
+`finish` saves the Python environment, flushes/unmounts Drive and releases only
+the named VM after a structured success receipt. Save application checkpoints
+beforehand. A remote Python error, timeout or missing receipt leaves the VM
+running for inspection, even when the official `colab exec` exits zero. A
+timeout can leave remote execution in progress; check `colab status`/`colab log`
+before repeating the command. `flush` only unmounts Drive. `rebuild` explicitly
+reinstalls saved requirements on a fresh changed image.
+
+Generate a self-contained notebook locally without allocating a runtime:
+
+```sh
+colab-workspace notebook -p training -o training.ipynb
+```
+
+Existing output files are never overwritten. Skills under `skills/` can be
+installed into `~/.codex/skills` with symlinks: `colab-persistence` describes this
+workflow; `colab-operator` is the installed official CLI's bundled skill with a
+local authentication note. Consult
+live CLI help for current flags because the bundled official skill may describe
+different authentication defaults from the installed release.
+
 ## Python environment
 
 Packages execute from `/content/persistent-colab/<project>/.venv`, using a virtual

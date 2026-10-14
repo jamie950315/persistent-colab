@@ -10,6 +10,9 @@ process alive.
 - `build_notebook.py`: generates the self-contained `PersistentColab.ipynb`.
 - `README.md`: operation and persistence boundaries.
 - `tests/`: integrity and compatibility checks for environment snapshots.
+- `colab_workspace_cli.py` and `pyproject.toml`: installed `colab-workspace`
+  companion using the official `colab` executable as its transport.
+- `skills/`: persistent-workspace skill and the official CLI's bundled skill.
 
 ## Operation
 - The private Drive deployment is in `My Drive/PersistentColab` and contains
@@ -32,3 +35,15 @@ process alive.
   without changing the default project's snapshot. This is directory and
   environment separation, not a security boundary; use separate kernels when
   switching projects and one snapshot writer per project.
+- The companion requires an explicit session name. It does not auto-allocate,
+  auto-authorize Drive or change official credentials/session-state files.
+- Remote commands use temporary notebooks and structured success receipts:
+  official `colab exec` 0.7.4 can return zero after a remote Python error.
+  `finish` must not stop a runtime until save and Drive flush confirm success.
+- Install locally with `uv tool install --editable /Users/jamie/persistent-colab`.
+  Installed skill directories in `~/.codex/skills` link to the tracked `skills/`.
+- The installed companion was tested on a real CPU VM through official CLI
+  0.7.4: Drive mount, existing snapshot restore, script execution/arguments,
+  exit-code propagation, package installation, status, and save/flush/stop.
+  The test VM was released. CLI protocol/release-gate tests use local transport
+  fixtures; helper persistence checks remain independent.
