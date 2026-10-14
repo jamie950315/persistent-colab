@@ -6,8 +6,8 @@ description: Preserve and restore Python/AI workspaces on Google Drive across Co
 # Colab persistence
 
 Use `colab-workspace` for durable workspace operations and the official `colab`
-CLI for VM lifecycle, authentication, transfers, and session history. The local
-source is `/Users/jamie/persistent-colab`. Run `colab-workspace --help` and
+CLI for VM lifecycle, authentication, transfers, and session history. The source
+repository is `jamie950315/persistent-colab` on GitHub. Run `colab-workspace --help` and
 `colab <command> --help` when command details are needed; the installed CLI's
 help takes precedence over older bundled examples.
 

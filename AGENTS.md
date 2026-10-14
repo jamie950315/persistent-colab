@@ -40,10 +40,14 @@ process alive.
 - Remote commands use temporary notebooks and structured success receipts:
   official `colab exec` 0.7.4 can return zero after a remote Python error.
   `finish` must not stop a runtime until save and Drive flush confirm success.
-- Install locally with `uv tool install --editable /Users/jamie/persistent-colab`.
+- Public repository: `https://github.com/jamie950315/persistent-colab`, branch `main`.
+- Install from a local checkout with `uv tool install --editable .`.
   Installed skill directories in `~/.codex/skills` link to the tracked `skills/`.
 - The installed companion was tested on a real CPU VM through official CLI
   0.7.4: Drive mount, existing snapshot restore, script execution/arguments,
   exit-code propagation, package installation, status, and save/flush/stop.
   The test VM was released. CLI protocol/release-gate tests use local transport
   fixtures; helper persistence checks remain independent.
+- The official operator skill is derived from `googlecolab/google-colab-cli`
+  0.7.4. Preserve its attribution and Apache-2.0 license in `THIRD_PARTY_NOTICES.md`
+  and `third_party/google-colab-cli/LICENSE` when distributing it.

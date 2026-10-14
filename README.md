@@ -60,7 +60,9 @@ Install the companion alongside the official CLI:
 
 ```sh
 uv tool install google-colab-cli  # Skip if already installed.
-uv tool install --editable /path/to/persistent-colab
+git clone https://github.com/jamie950315/persistent-colab.git
+cd persistent-colab
+uv tool install --editable .
 colab-workspace doctor
 ```
 
@@ -105,6 +107,21 @@ workflow; `colab-operator` is the installed official CLI's bundled skill with a
 local authentication note. Consult
 live CLI help for current flags because the bundled official skill may describe
 different authentication defaults from the installed release.
+
+From the repository checkout, install the skills with:
+
+```sh
+python3 - <<'PY'
+from pathlib import Path
+destination = Path.home() / '.codex' / 'skills'
+destination.mkdir(parents=True, exist_ok=True)
+for name in ('colab-persistence', 'colab-operator'):
+    (destination / name).symlink_to(Path.cwd() / 'skills' / name, target_is_directory=True)
+PY
+```
+
+Keep the checkout available while using these symlinks. Existing skill
+directories are preserved: the installer fails rather than replacing them.
 
 ## Python environment
 
@@ -164,3 +181,5 @@ The notebook embeds the helper so it can bootstrap without a GitHub repository
 or credentials. Regenerate it after helper changes.
 
 Reference: [Google Colab FAQ](https://research.google.com/colaboratory/faq.html).
+
+Third-party attribution: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

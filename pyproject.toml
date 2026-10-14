@@ -9,6 +9,10 @@ description = "Drive-backed Python workspaces alongside the official Google Cola
 readme = "README.md"
 requires-python = ">=3.12"
 
+[project.urls]
+Repository = "https://github.com/jamie950315/persistent-colab"
+Issues = "https://github.com/jamie950315/persistent-colab/issues"
+
 [project.scripts]
 colab-workspace = "colab_workspace_cli:main"
 
