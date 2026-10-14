@@ -26,3 +26,9 @@ process alive.
 - Verified with two separate CPU VMs: a saved Python package, output file and
   JSON checkpoint survived release. GPU/CUDA extensions need hardware-specific
   validation when introduced. Drive authorization may be required for a new VM.
+- A separate Drive notebook, `CrossNotebookVerification.ipynb`, also restored
+  the original project's package, file and checkpoint. A differently named
+  project kept its file, checkpoint and saved-package directories separate,
+  without changing the default project's snapshot. This is directory and
+  environment separation, not a security boundary; use separate kernels when
+  switching projects and one snapshot writer per project.

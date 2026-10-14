@@ -31,6 +31,29 @@ My Drive/PersistentColab/
       snapshots/<timestamp>.json
 ```
 
+## Use from another notebook
+
+Add this initialization cell before importing project packages:
+
+```python
+from google.colab import drive
+from pathlib import Path
+
+drive.mount('/content/drive')
+exec(Path('/content/drive/MyDrive/PersistentColab/persistent_colab.py').read_text())
+ws = Workspace('default')
+ws.prepare()
+ws.activate()
+```
+
+The same project name shares the durable files and saved environment across
+notebooks. A different name creates separate workspace and environment
+directories. Initialize each notebook explicitly; this is not an account-wide
+Colab setting. Keep one writer per project, and use separate kernels for different
+projects to avoid already imported modules carrying over. All projects remain
+accessible to the same Drive account; separate directories are not a security
+boundary.
+
 ## Python environment
 
 Packages execute from `/content/persistent-colab/<project>/.venv`, using a virtual
