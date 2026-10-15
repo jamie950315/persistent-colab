@@ -14,7 +14,7 @@ import colab_workspace_cli as cli
 
 
 class CliTest(unittest.TestCase):
-    def transport(self, receipt=None, error=False, mounted=True):
+    def transport(self, receipt=None, error=False, mounted=True, setup=None):
         def run(command):
             source = Path(command[command.index('-f') + 1])
             code = json.loads(source.read_text())['cells'][0]['source']
@@ -28,6 +28,8 @@ class CliTest(unittest.TestCase):
                 if not error:
                     with tempfile.TemporaryDirectory() as root, \
                          patch('os.path.ismount', return_value=mounted):
+                        if setup:
+                            setup(Path(root))
                         replaced = code.replace("Path('/content/drive/MyDrive')", f"Path({root!r})")
                         replaced = replaced.replace("Path('/mnt/pc')", f"Path({root!r})")
                         exec(replaced, namespace)
@@ -58,12 +60,31 @@ class CliTest(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][1], 'exec')
 
     def test_successful_finish_stops_exact_session_after_receipt(self):
-        args = ['--auth', 'oauth2', '--config', '/tmp/state with spaces.json', 'finish', '-s', 'specific']
+        args = ['--auth', 'oauth2', '--config', '/tmp/state with spaces.json', 'finish',
+                '-s', 'specific', '--space', 'research', '-p', 'training']
+        helper = """class Workspace:
+    def __init__(self, project, drive_root=None, session=None, space='default'):
+        assert (project, drive_root.name, session, space) == ('training', 'PersistentColabData', 'specific', 'research')
+    def prepare(self, **options):
+        print('prepare')
+    def save_environment(self):
+        print('save')
+    def flush(self):
+        print('flush')
+"""
+        transport = self.transport()
+        def run(command):
+            if 'exec' in command:
+                return transport(command)
+            self.assertEqual(stdout.getvalue().splitlines(), ['prepare', 'save', 'flush'])
+            return subprocess.CompletedProcess(command, 0)
+        stdout = io.StringIO()
         with patch('colab_workspace_cli.official_command', return_value=['colab', '--auth', 'oauth2']), \
-             patch('colab_workspace_cli.execute_remote', return_value=0), \
-             patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0)) as run:
+             patch('colab_workspace_cli.helper_source', return_value=helper), \
+             patch('subprocess.run', side_effect=run) as process, redirect_stdout(stdout):
             self.assertEqual(cli.main(args), 0)
-        self.assertEqual(run.call_args.args[0], ['colab', '--auth', 'oauth2', 'stop', '-s', 'specific'])
+        self.assertEqual(process.call_count, 2)
+        self.assertEqual(process.call_args.args[0], ['colab', '--auth', 'oauth2', 'stop', '-s', 'specific'])
 
     def test_script_source_arguments_are_python_data(self):
         with tempfile.TemporaryDirectory() as root:
@@ -82,7 +103,7 @@ class CliTest(unittest.TestCase):
             helper = f"""from pathlib import Path
 import sys
 class Workspace:
-    def __init__(self, project, workspaces, session=None):
+    def __init__(self, project, drive_root=None, session=None, space='default'):
         self.root = Path({root!r})
         self.local = self.root
         self.python = Path(sys.executable)
@@ -114,12 +135,112 @@ class Workspace:
             with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 cli.parser().parse_args(['--mount-point', bad, 'status', '-s', 't'])
 
+    def test_space_option_accepts_either_position_and_defaults(self):
+        before = cli.parser().parse_args(['--space', 'research', 'status', '-s', 't'])
+        after = cli.parser().parse_args(['status', '-s', 't', '--space', 'research'])
+        default = cli.parser().parse_args(['status', '-s', 't'])
+        override = cli.parser().parse_args(['--space', 'first', 'status', '-s', 't', '--space', 'second'])
+        notebook = cli.parser().parse_args(['notebook', '--space', 'research', '-o', 'workspace.ipynb'])
+        self.assertEqual((before.space, after.space, default.space, override.space, notebook.space),
+                         ('research', 'research', 'default', 'second', 'research'))
+        for bad in ('', '../other', 'a/b', '-hidden', 'x' * 65, "x'\ncode"):
+            with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                cli.parser().parse_args(['status', '-s', 't', '--space', bad])
+
+    def test_status_uses_selected_space_without_creating_workspace(self):
+        for storage in ('colab-drive', 'rclone'):
+            with self.subTest(storage=storage):
+                def seed(mount):
+                    data_root = mount if storage == 'rclone' else mount / 'PersistentColabData'
+                    for space in ('research', 'default'):
+                        environment = data_root / 'spaces' / space / 'workspaces' / 'training' / 'environment'
+                        environment.mkdir(parents=True)
+                        (environment / 'latest.json').write_text(json.dumps({'space_marker': space}))
+                args = cli.parser().parse_args(['status', '-s', 't', '-p', 'training',
+                                              '--space', 'research', '--storage', storage])
+                stdout = io.StringIO()
+                with patch('subprocess.run', side_effect=self.transport(setup=seed)), redirect_stdout(stdout):
+                    self.assertEqual(cli.execute_remote(args, ['colab']), 0)
+                status = json.loads(stdout.getvalue())
+                self.assertEqual((status['space'], status['project']), ('research', 'training'))
+                self.assertEqual(status['snapshot'], {'space_marker': 'research'})
+                self.assertEqual(status['root'], status['data_root'] + '/spaces/research/workspaces/training')
+                self.assertEqual(status['local_python'], '/content/persistent-colab/research/training/.venv/bin/python')
+                missing = cli.parser().parse_args(['status', '-s', 't', '--space', 'missing', '--storage', storage])
+                with patch('subprocess.run', side_effect=self.transport()), redirect_stdout(io.StringIO()) as out:
+                    self.assertEqual(cli.execute_remote(missing, ['colab']), 0)
+                self.assertFalse(json.loads(out.getvalue())['exists'])
+
+    def test_spaces_lists_mounted_data_root_without_creating_spaces(self):
+        def seed(mount):
+            for space, project in (('research', 'zeta'), ('research', 'alpha'), ('default', 'default')):
+                (mount / 'spaces' / space / 'workspaces' / project).mkdir(parents=True)
+            (mount / 'spaces' / 'empty').mkdir()
+            (mount / 'spaces' / 'unrelated-file').write_text('ignored')
+            (mount / 'spaces' / 'research' / 'workspaces' / 'unrelated-file').write_text('ignored')
+        args = cli.parser().parse_args(['spaces', '-s', 't', '--storage', 'rclone'])
+        for setup, expected in ((seed, [{'space': 'default', 'projects': ['default']},
+                                        {'space': 'empty', 'projects': []},
+                                        {'space': 'research', 'projects': ['alpha', 'zeta']}]), (None, [])):
+            with patch('subprocess.run', side_effect=self.transport(setup=setup)), \
+                 redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(cli.execute_remote(args, ['colab']), 0)
+            self.assertEqual(json.loads(stdout.getvalue())['spaces'], expected)
+
+    def test_workspace_commands_pass_data_root_space_and_expected_operations(self):
+        helper = """class Workspace:
+    def __init__(self, project, drive_root=None, session=None, space='default'):
+        print('workspace', project, drive_root.name, session, space)
+    def prepare(self, **options):
+        print('prepare', options)
+    def rebuild(self, **options):
+        print('rebuild', options)
+    def rebuild_system(self, **options):
+        print('rebuild_system', options)
+    def compact(self):
+        print('compact')
+"""
+        for name, expected in (('restore', 'prepare'), ('rebuild', 'rebuild'),
+                               ('rebuild-system', 'rebuild_system'), ('compact', 'compact')):
+            with self.subTest(command=name):
+                args = cli.parser().parse_args([name, '-s', 'specific', '-p', 'training',
+                                              '--space', 'research', '--force-unlock'])
+                with patch('colab_workspace_cli.helper_source', return_value=helper), \
+                     patch('subprocess.run', side_effect=self.transport()), \
+                     redirect_stdout(io.StringIO()) as stdout:
+                    self.assertEqual(cli.execute_remote(args, ['colab']), 0)
+                lines = stdout.getvalue().splitlines()
+                self.assertEqual(lines[0], 'workspace training PersistentColabData specific research')
+                self.assertTrue(lines[-1].startswith(expected))
+                self.assertIn("'force_unlock': True", stdout.getvalue())
+                self.assertEqual(any(line.startswith('prepare') for line in lines), name in ('restore', 'compact'))
+
+    def test_flush_and_prune_address_the_selected_space(self):
+        helper = """def release_lock(root):
+    print('release', root)
+def flush_rclone(roots):
+    print('flush', roots[0])
+def prune_snapshots(root, keep, apply=False):
+    print('prune', root, keep, apply)
+"""
+        for name in ('flush', 'prune'):
+            argv = [name, '-s', 't', '-p', 'training', '--space', 'research', '--storage', 'rclone']
+            if name == 'prune':
+                argv += ['--keep', '2']
+            args = cli.parser().parse_args(argv)
+            with patch('colab_workspace_cli.helper_source', return_value=helper), \
+                 patch('subprocess.run', side_effect=self.transport()), \
+                 redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(cli.execute_remote(args, ['colab']), 0)
+            for line in stdout.getvalue().splitlines():
+                self.assertIn('/spaces/research/workspaces/training', line)
+
     def test_rclone_status_reads_mounted_workspace(self):
         args = cli.parser().parse_args(['--storage', 'rclone', 'status', '-s', 'test'])
         stdout = io.StringIO()
         with patch('subprocess.run', side_effect=self.transport()), redirect_stdout(stdout):
             self.assertEqual(cli.execute_remote(args, ['colab']), 0)
-        self.assertTrue(json.loads(stdout.getvalue())['root'].endswith('/workspaces/default'))
+        self.assertTrue(json.loads(stdout.getvalue())['root'].endswith('/spaces/default/workspaces/default'))
 
     def test_unmounted_rclone_storage_is_failure(self):
         args = cli.parser().parse_args(['--storage', 'rclone', 'restore', '-s', 'test'])
@@ -175,9 +296,13 @@ class Workspace:
     def test_notebook_never_overwrites_existing_file(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / 'notebook.ipynb'
-            self.assertEqual(cli.main(['notebook', '-p', 'training', '-o', str(path)]), 0)
+            self.assertEqual(cli.main(['notebook', '-p', 'training', '--space', 'research', '-o', str(path)]), 0)
             original = path.read_bytes()
             notebook = json.loads(original)
+            restore = ''.join(notebook['cells'][2]['source'])
+            self.assertIn("SPACE = 'research'", restore)
+            self.assertIn("PROJECT = 'training'", restore)
+            self.assertIn('Workspace(PROJECT, space=SPACE)', restore)
             for cell in notebook['cells']:
                 if cell['cell_type'] == 'code':
                     compile(''.join(cell['source']), cell['id'], 'exec')

@@ -41,7 +41,7 @@ def mount_point(value):
 def rclone_remote(value):
     # A named remote from the uploaded config, optionally followed by a path.
     if not re.fullmatch(r"[A-Za-z0-9_.+@][A-Za-z0-9_.+@ -]*:[^\r\n]*", value):
-        raise argparse.ArgumentTypeError("Use NAME:path with a remote defined in the rclone config, such as gdrive:PersistentColab.")
+        raise argparse.ArgumentTypeError("Use NAME:path with a remote defined in the rclone config, such as gdrive:PersistentColabData.")
     return value
 
 
@@ -71,6 +71,12 @@ def storage_arguments(parser, default):
                         help="Runtime rclone mount point (default: /mnt/pc)")
 
 
+def space_argument(parser, default):
+    parser.add_argument("--space", type=project_name,
+                        default="default" if default else argparse.SUPPRESS,
+                        help="Workspace space within the shared data root (default: default)")
+
+
 def keep_count(value):
     number = int(value)
     if number < 1:
@@ -86,6 +92,7 @@ def parser():
     result.add_argument("--config", help="Official CLI session-state file")
     result.add_argument("--client-oauth-config", help="Official CLI OAuth client configuration")
     storage_arguments(result, default=True)
+    space_argument(result, default=True)
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor", help="Check the official CLI version and authenticated sessions (no allocation)")
     notebook = commands.add_parser("notebook", help="Generate a self-contained Colab notebook locally")
@@ -97,7 +104,7 @@ def parser():
     rclone.add_argument("-s", "--session", required=True)
     rclone.add_argument("--conf", type=Path, default=Path.home() / ".config" / "rclone" / "rclone.conf",
                         help="Local rclone config to upload (default: ~/.config/rclone/rclone.conf)")
-    rclone.add_argument("--remote", type=rclone_remote, required=True, help="Remote and folder, such as gdrive:PersistentColab")
+    rclone.add_argument("--remote", type=rclone_remote, required=True, help="Shared data remote and folder, such as gdrive:PersistentColabData")
     rclone.add_argument("--mount-point", type=mount_point, default=argparse.SUPPRESS,
                         help="Runtime mount point (default: /mnt/pc)")
     rclone.add_argument("--timeout", type=positive_timeout, default=600,
@@ -108,24 +115,28 @@ def parser():
         ("run", "Execute a local Python script in the workspace's own Python process"),
         ("save", "Save an immutable environment snapshot"),
         ("status", "Read workspace paths and saved snapshot metadata"),
-        ("rebuild", "Explicitly reinstall saved requirements on a fresh changed base image"),
-        ("prune", "List old environment snapshots to delete; delete only with --yes"),
+        ("spaces", "List spaces and projects on an existing mounted VM"),
+        ("rebuild", "Explicitly reinstall saved virtual-environment requirements"),
+        ("rebuild-system", "Explicitly reinstall saved apt/system pip packages on a fresh image"),
+        ("compact", "Compact the system layer chain; retain old layers until explicit prune"),
+        ("prune", "List old snapshots and unreferenced system layers; delete only with --yes"),
         ("flush", "Flush and unmount storage without releasing the VM"),
         ("finish", "Save, flush storage, then release this named VM; stop only after success"),
     ):
         command = commands.add_parser(name, help=help_text)
         storage_arguments(command, default=False)
         command.add_argument("-s", "--session", required=True)
-        command.add_argument("-p", "--project", type=project_name, default="default")
+        if name != "spaces":
+            command.add_argument("-p", "--project", type=project_name, default="default")
         # Official exec has a wall-clock deadline and accepts no unlimited value.
         # Long jobs default to Colab's maximum session length instead.
         default_timeout = 86400 if name == "run" else 600
         command.add_argument("--timeout", type=positive_timeout, default=default_timeout,
                              help=f"Official remote execution timeout in seconds (default: {default_timeout})")
-        if name in ("restore", "install", "run", "save", "rebuild", "finish"):
+        if name in ("restore", "install", "run", "save", "rebuild", "rebuild-system", "compact", "finish"):
             command.add_argument("--force-unlock", action="store_true",
                                  help="Take over a workspace lock left by a runtime that no longer exists")
-        if name in ("restore", "install", "run", "save", "finish"):
+        if name in ("restore", "install", "run", "save", "compact", "finish"):
             command.add_argument("--allow-base-drift", action="store_true",
                                  help="Restore despite changed base packages, then require pip check to pass")
         if name == "prune":
@@ -136,6 +147,8 @@ def parser():
         if name == "run":
             command.add_argument("-f", "--file", type=Path, required=True)
             command.add_argument("script_args", nargs=argparse.REMAINDER, help="Script arguments following --")
+    for command in commands.choices.values():
+        space_argument(command, default=False)
     return result
 
 
@@ -162,12 +175,12 @@ def storage_setup(args):
         return f"""storage = Path({args.mount_point!r})
 if not os.path.ismount(storage):
     raise RuntimeError('rclone storage is not mounted at ' + str(storage) + '. Run colab-workspace mount-rclone -s SESSION --remote NAME:path first.')
-workspaces = storage / 'workspaces'
+data_root = storage
 """
     return """storage = Path('/content/drive/MyDrive')
 if not storage.is_dir():
     raise RuntimeError('Drive is not mounted. Run colab-workspace mount -s SESSION in an interactive terminal, mount Drive in the notebook, or use --storage rclone. Mount authorization is required on each new VM.')
-workspaces = storage / 'PersistentColab' / 'workspaces'
+data_root = storage / 'PersistentColabData'
 """
 
 
@@ -195,28 +208,47 @@ def stream_process(command, cwd, env=None):
 """
     # Give helper classes their own module-like globals to avoid overwriting user globals.
     helper = f"namespace = {{'__name__': 'persistent_colab_workspace'}}\nexec({helper_source()!r}, namespace)\n"
+    project_root = f"data_root / 'spaces' / {args.space!r} / 'workspaces' / {getattr(args, 'project', 'default')!r}"
     if args.command == "status":
-        operation = f"""root = workspaces / {args.project!r}
+        operation = f"""root = {project_root}
 latest = root / 'environment' / 'latest.json'
-print(json.dumps({{'project': {args.project!r}, 'storage': {args.storage!r}, 'root': str(root), 'exists': root.is_dir(),
-                  'local_python': str(Path('/content/persistent-colab') / {args.project!r} / '.venv/bin/python'),
+print(json.dumps({{'space': {args.space!r}, 'project': {args.project!r}, 'storage': {args.storage!r},
+                  'data_root': str(data_root), 'root': str(root), 'exists': root.is_dir(),
+                  'local_python': str(Path('/content/persistent-colab') / {args.space!r} / {args.project!r} / '.venv/bin/python'),
                   'snapshot': json.loads(latest.read_text()) if latest.exists() else None}}, indent=2))
+"""
+    elif args.command == "spaces":
+        operation = """spaces_root = data_root / 'spaces'
+spaces = []
+if spaces_root.is_dir():
+    for path in sorted(spaces_root.iterdir()):
+        if path.is_dir():
+            projects_root = path / 'workspaces'
+            projects = []
+            if projects_root.is_dir():
+                projects = sorted(project.name for project in projects_root.iterdir() if project.is_dir())
+            spaces.append({'space': path.name, 'projects': projects})
+print(json.dumps({'storage': """ + repr(args.storage) + """, 'data_root': str(data_root), 'spaces': spaces}, indent=2))
 """
     elif args.command == "mount-rclone":
         operation = helper + f"namespace['mount_rclone']({args.remote!r}, {args.mount_point!r}, {args.staged_config!r})\n"
     elif args.command == "prune":
-        operation = helper + f"namespace['prune_snapshots'](workspaces / {args.project!r}, {args.keep!r}, apply={args.yes!r})\n"
+        operation = helper + f"namespace['prune_snapshots']({project_root}, {args.keep!r}, apply={args.yes!r})\n"
     elif args.command == "flush" and args.storage == "rclone":
-        operation = helper + f"namespace['release_lock'](workspaces / {args.project!r})\nnamespace['flush_rclone']([workspaces / {args.project!r}])\n"
+        operation = helper + f"namespace['release_lock']({project_root})\nnamespace['flush_rclone']([{project_root}])\n"
     elif args.command == "flush":
-        operation = helper + f"namespace['release_lock'](workspaces / {args.project!r})\nfrom google.colab import drive\ndrive.flush_and_unmount()\nprint('Drive writes flushed; Drive is unmounted.')\n"
+        operation = helper + f"namespace['release_lock']({project_root})\nfrom google.colab import drive\ndrive.flush_and_unmount()\nprint('Drive writes flushed; Drive is unmounted.')\n"
     else:
-        operation = helper + f"ws = namespace['Workspace']({args.project!r}, workspaces, session={args.session!r})\n"
+        operation = helper + f"ws = namespace['Workspace']({args.project!r}, drive_root=data_root, session={args.session!r}, space={args.space!r})\n"
         if args.command == "rebuild":
             operation += f"ws.rebuild(force_unlock={args.force_unlock!r})\n"
+        elif args.command == "rebuild-system":
+            operation += f"ws.rebuild_system(force_unlock={args.force_unlock!r})\n"
         else:
             operation += f"ws.prepare(force_unlock={args.force_unlock!r}, allow_base_drift={args.allow_base_drift!r})\n"
-            if args.command == "install":
+            if args.command == "compact":
+                operation += "ws.compact()\n"
+            elif args.command == "install":
                 if any(p.startswith("-") for p in args.packages):
                     raise ValueError("Pass package specifications, not pip options.")
                 operation += f"""pip_command = [str(ws.python), '-u', '-m', 'pip', 'install', *{args.packages!r}]
@@ -249,14 +281,36 @@ print('Packages installed; environment snapshot saved.')
     return "def _colab_workspace_operation():\n" + "".join("    " + line + "\n" for line in code.splitlines()) + "_colab_workspace_operation()\ndel _colab_workspace_operation\n"
 
 
-def notebook_document(project):
+def notebook_document(project, space="default"):
     sources = [
-        ("markdown", "# Persistent Colab workspace\n\nRun mount and restore before importing project packages. Files under `ws.root` and saved packages survive runtime release. RAM, GPU memory and processes do not. Save application checkpoints explicitly; use one writer per project.\n"),
+        ("markdown", """# Persistent Colab workspace
+
+On a fresh VM, run mount and restore before installing packages, changing system
+files or importing project dependencies, including the first use of a project.
+This records the unmodified image baseline so saved changes and package rebuild
+recipes are accurate. Keep the same SPACE and PROJECT to reuse files and saved
+environments from the shared PersistentColabData root. Save application
+checkpoints explicitly; use one project per VM and one writer per project. Use a
+fresh VM to switch projects or spaces.
+
+Save captures the virtual environment plus apt/system pip changes and files under
+`/usr/local`, `/opt`, `/etc`, `/var/lib` and `/root/.local`, excluding volatile
+paths, known credential locations and other mounts. Keep secrets in Colab Secrets;
+arbitrary secrets in captured directories can still be archived. RAM, GPU memory,
+processes and host GPU drivers do not persist.
+
+System layers require the same base image. On a fresh changed image, explicitly
+use `ws.rebuild_system()` to reinstall recorded apt/system pip packages and begin
+a new chain, then `ws.rebuild()` for virtual-environment requirements. Arbitrary
+files from the old image are not replayed; keep their setup in source control.
+`ws.compact()` compacts layers; old layers remain until explicit pruning.
+"""),
         ("code", "# @title Mount Google Drive\nfrom google.colab import drive\ndrive.mount('/content/drive')\n"),
-        ("code", "# @title Restore workspace\n" + f"PROJECT = {project!r}  # @param {{type:\"string\"}}\n" +
-         f"exec({helper_source()!r})\nws = Workspace(PROJECT)\nws.prepare()\nws.activate()\n"),
+        ("code", "# @title Restore workspace\n" + f"SPACE = {space!r}  # @param {{type:\"string\"}}\n" +
+         f"PROJECT = {project!r}  # @param {{type:\"string\"}}\n" +
+         f"exec({helper_source()!r})\nws = Workspace(PROJECT, space=SPACE)\nws.prepare()\nws.activate()\n"),
         ("code", "# Write your code here. Install packages with ws.install('package==version').\nprint('Persistent workspace:', ws.root)\n"),
-        ("code", "# @title Save Python environment\nws.save_environment()\n"),
+        ("code", "# @title Save system and Python environments\nws.save_environment()\n"),
         ("code", "# @title Flush Drive when finished, then disconnect and delete runtime\nFLUSH_DRIVE = False  # @param {type:\"boolean\"}\nif FLUSH_DRIVE:\n    ws.flush()\n"),
     ]
     cells = []
@@ -302,7 +356,7 @@ def main(argv=None):
     try:
         if args.command == "notebook":
             with args.output.open("x") as stream:
-                json.dump(notebook_document(args.project), stream, indent=2)
+                json.dump(notebook_document(args.project, args.space), stream, indent=2)
                 stream.write("\n")
             print(args.output.resolve())
             return 0

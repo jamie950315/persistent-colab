@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import persistent_colab
-from persistent_colab import Workspace, flush_rclone, mount_rclone
+from persistent_colab import Workspace, SystemLayer, flush_rclone, mount_rclone
 
 
 SIGNATURE = {"python": [3, 14], "machine": "test", "os": "test", "libc": [],
@@ -87,7 +87,7 @@ class RcloneTest(unittest.TestCase):
         ]
         for item in self.patches:
             item.start()
-        self.workspace = Workspace("demo", self.mount / "workspaces", self.root / "runtime").prepare()
+        self.workspace = Workspace("demo", self.mount, self.root / "runtime").prepare()
         (self.workspace.venv / "lib" / "package.txt").write_text("saved")
         self.workspace.save_environment()
 
@@ -125,7 +125,7 @@ class RcloneTest(unittest.TestCase):
         remote = self.root / "remote"
         shutil.copytree(self.mount, remote)
         lock = json.loads((self.workspace.env_dir / "LOCK").read_text())
-        (remote / "workspaces" / "demo" / "environment" / "LOCK").write_text(json.dumps(lock))
+        (remote / "spaces" / "default" / "workspaces" / "demo" / "environment" / "LOCK").write_text(json.dumps(lock))
         persistent_colab.release_lock(self.workspace.root)
         with patch.dict(os.environ, {"FAKE_REMOTE_ROOT": str(remote)}):
             with self.assertRaisesRegex(RuntimeError, "lock is still on the remote"):
@@ -134,8 +134,8 @@ class RcloneTest(unittest.TestCase):
 
     def test_remote_pointer_mismatch_keeps_mount_and_credentials(self):
         remote = self.root / "remote"
-        (remote / "workspaces" / "demo" / "environment").mkdir(parents=True)
-        (remote / "workspaces" / "demo" / "environment" / "latest.json").write_text('{"archive": "old"}')
+        (remote / "spaces" / "default" / "workspaces" / "demo" / "environment").mkdir(parents=True)
+        (remote / "spaces" / "default" / "workspaces" / "demo" / "environment" / "latest.json").write_text('{"archive": "old"}')
         with patch.dict(os.environ, {"FAKE_REMOTE_ROOT": str(remote)}):
             with self.assertRaisesRegex(RuntimeError, "differs"):
                 flush_rclone([self.workspace.root])
@@ -145,6 +145,49 @@ class RcloneTest(unittest.TestCase):
         self.stats.write_text(json.dumps([{"uploadsInProgress": 0, "uploadsQueued": 0, "erroredFiles": 1}]))
         with self.assertRaisesRegex(RuntimeError, "failed to upload"):
             flush_rclone([self.workspace.root])
+        self.assertTrue(self.mounted.exists() and self.config.exists())
+
+    def system_layer(self):
+        fs = self.root / "system-fs"
+        (fs / "opt").mkdir(parents=True)
+        (fs / "opt/proof").write_text("system archive")
+        system = SystemLayer(self.workspace.root, self.mount, self.workspace.local,
+                             fs_root=fs, image_id="test-image", start_time=0,
+                             packages=lambda: {"apt": {}, "pip": {}})
+        system.restore()
+        system.save()
+        return system
+
+    def test_flush_verifies_system_chain_and_baseline_before_unmount(self):
+        self.system_layer()
+        self.workspace.flush()
+        self.assertFalse(self.mounted.exists() or self.config.exists())
+
+    def test_system_archive_mismatch_keeps_mount_and_credentials(self):
+        system = self.system_layer()
+        remote = self.root / "remote"
+        shutil.copytree(self.mount, remote)
+        archive = next(system.layers.glob("*.tar.gz"))
+        (remote / archive.relative_to(self.mount)).write_bytes(b"corrupt remote")
+        persistent_colab.release_lock(self.workspace.root)
+        (remote / self.workspace.env_dir.relative_to(self.mount) / "LOCK").unlink()
+        with patch.dict(os.environ, {"FAKE_REMOTE_ROOT": str(remote)}):
+            with self.assertRaisesRegex(RuntimeError, "system archive does not match"):
+                flush_rclone([self.workspace.root])
+        self.assertTrue(self.mounted.exists() and self.config.exists())
+
+    def test_system_only_rebuild_is_verified_without_a_venv_pointer(self):
+        system = self.system_layer()
+        self.workspace.latest.unlink()
+        remote = self.root / "remote"
+        shutil.copytree(self.mount, remote)
+        archive = next(system.layers.glob("*.tar.gz"))
+        (remote / archive.relative_to(self.mount)).write_bytes(b"corrupt remote")
+        persistent_colab.release_lock(self.workspace.root)
+        (remote / self.workspace.env_dir.relative_to(self.mount) / "LOCK").unlink()
+        with patch.dict(os.environ, {"FAKE_REMOTE_ROOT": str(remote)}):
+            with self.assertRaisesRegex(RuntimeError, "system archive does not match"):
+                flush_rclone([self.workspace.root])
         self.assertTrue(self.mounted.exists() and self.config.exists())
 
     def test_snapshot_never_contains_rclone_credentials(self):

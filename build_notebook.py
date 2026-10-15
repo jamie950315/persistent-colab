@@ -15,32 +15,33 @@ def cell(kind, text):
 cells = [
     cell("markdown", """# Persistent Colab workspace
 
-Keep files and a saved Python environment in Google Drive, then restore them on a new CPU or GPU runtime.
+Keep files, a saved Python environment and system installation layers in Google Drive, then restore them on a compatible new runtime.
 
-**Start:** choose CPU for ordinary development, or select a GPU when needed. Run cells 1 and 2 before importing your own packages. Grant Drive access if Google asks. Use the same project name on future visits.
+**Start:** choose CPU for ordinary development, or select a GPU when needed. On a fresh VM, run cells 1 and 2 before installing packages, changing system files or importing project dependencies, including the first time you use a project. This records the unmodified image baseline so saved changes and package rebuild recipes are accurate. Grant Drive access if Google asks. Use the same SPACE and PROJECT on future visits. Data lives under `My Drive/PersistentColabData/spaces/SPACE/workspaces/PROJECT`.
 
 **Finish:** save model/training checkpoints, run **Save environment**, then **Flush Drive**. Finally use **Runtime → Disconnect and delete runtime** to release compute.
 
-Drive preserves files and saved environment archives. A released VM loses RAM, GPU memory, running programs and unsaved changes. A Python/base-image change requires an explicit environment rebuild. Google Drive capacity does not enlarge the runtime disk.
+Drive preserves files and saved environment archives. A released VM loses RAM, GPU memory, running programs and unsaved changes. System layers require the same base image; changing images requires an explicit rebuild on a fresh VM. Host GPU drivers are not saved. Google Drive capacity does not enlarge the runtime disk.
 """),
     cell("code", """# @title 1. Mount Google Drive
 from google.colab import drive
 drive.mount('/content/drive')
 """),
-    cell("code", "# @title 2. Restore workspace and Python environment\n" +
+    cell("code", "# @title 2. Restore workspace, system and Python environments\n" +
+         "SPACE = 'default'  # @param {type:\"string\"}\n" +
          "PROJECT = 'default'  # @param {type:\"string\"}\n" +
          "exec(" + repr((ROOT / "persistent_colab.py").read_text()) + ")\n" +
-         "ws = Workspace(PROJECT)\nws.prepare()\nws.activate()\n" +
+         "ws = Workspace(PROJECT, space=SPACE)\nws.prepare()\nws.activate()\n" +
          "print('Previous saved state:', ws.read_checkpoint())\n"),
     cell("markdown", """## Work here
 
 Your current directory is the durable Drive workspace. Use `ws.root / 'src'`, `'data'`, `'models'`, `'outputs'`, and `'checkpoints'` for files that must survive.
 
-Install additional packages with `ws.install('package==version')`; it saves the environment immediately. The environment inherits Colab's preinstalled AI libraries. Do not use `%pip` or `!pip` for packages you want this environment to retain. Use `ws.run(code)` or `subprocess.run([str(ws.python), ...])` for an independent Python process and for packages already imported by the notebook kernel. Installing a replacement for an already loaded package requires restarting the kernel and running cells 1 and 2 again.
+Install workspace Python packages with `ws.install('package==version')`; it saves the environment immediately. The environment inherits Colab's preinstalled AI libraries. `%pip` and `!pip` affect the system environment instead; save those changes with `ws.save_environment()`. Use `ws.run(code)` or `subprocess.run([str(ws.python), ...])` for an independent Python process and for packages already imported by the notebook kernel. Installing a replacement for an already loaded package requires restarting the kernel and running cells 1 and 2 again.
 
 Hugging Face model downloads and Torch downloads use the Drive model directory. Authentication tokens stay on the temporary runtime. Keep secrets in Colab Secrets; never in the notebook, workspace or checkpoints.
 
-For many small files, unpack a dataset on the runtime's local disk for speed, retaining its original archive on Drive. Only files actually saved back to Drive survive. Concurrent writers to the same project are unsupported.
+For many small files, unpack a dataset on the runtime's local disk for speed, retaining its original archive on Drive. Only files actually saved back to Drive survive. Use one project per VM: system restoration changes the whole VM. Spaces and projects separate directories, not account permissions. Concurrent writers to the same project are unsupported.
 """),
     cell("code", """# @title Optional: install and save packages
 # Uncomment and change the package list when needed.
@@ -59,7 +60,7 @@ Use `ws.write_checkpoint({'step': 100, ...})` for JSON state; load it with `ws.r
 
 For Hugging Face Trainer, set `output_dir=str(ws.root / 'checkpoints' / 'training')`, save checkpoints regularly, and use `trainer.train(resume_from_checkpoint=...)` to resume a complete checkpoint. Saving model weights alone does not preserve optimizer, scheduler and training progress. Keep the model, dataset and training configuration compatible when resuming.
 
-System installations (`apt`), OS services and driver changes are not included in the Python snapshot. Put necessary setup commands in explicit notebook cells and rerun them on a new VM.
+`ws.save_environment()` also saves apt/system pip installation state and filesystem changes under `/usr/local`, `/opt`, `/etc`, `/var/lib` and `/root/.local`. It excludes volatile paths, known credential locations and other mounts. Keep secrets in Colab Secrets; arbitrary secrets placed in captured directories can still be archived. Configuration files may persist, but running OS services and host GPU drivers do not.
 """),
     cell("code", """# @title Save environment
 saved_environment = ws.save_environment()
@@ -69,7 +70,9 @@ print('Saved at:', saved_environment['created_utc'])
 
 Check **FLUSH_DRIVE** and run the next cell **only when finished**. It releases the workspace lock, then flushes and unmounts Drive. Then disconnect and delete the runtime using the Runtime menu. To continue working after unmounting, mount Drive again.
 
-If Colab reports that its Python/base image changed, restart with a fresh runtime, run cell 1 and instantiate `ws` using cell 2; after the compatibility error, run `ws.rebuild()` and `ws.activate()` in a separate cell. This explicitly reinstalls the recorded package versions and saves a new snapshot; previous snapshots remain on Drive. Reinstallation can fail when a package no longer supports the new image. When only base packages changed, `ws.prepare(allow_base_drift=True)` restores the saved environment instead and removes it again if `pip check` reports a new conflict. CPU and GPU runtimes use different base images.
+If Colab reports a system/base-image mismatch, start a fresh runtime, mount Drive and instantiate `ws` from cell 2. Run `ws.rebuild_system()` to explicitly reinstall recorded apt/system pip packages and start a new system layer chain; arbitrary files from the old image are not replayed onto a different image. Then use `ws.rebuild()` for saved virtual-environment package requirements and `ws.activate()`. Keep required manual setup in source control. Reinstallation can fail when packages no longer support the new image; old snapshots remain on Drive.
+
+`ws.compact()` replaces the current system layer chain with a compact layer; old layers remain until an explicit prune. CPU and GPU runtimes use different base images. `ws.prepare(allow_base_drift=True)` only relaxes virtual-environment base-package checks with `pip check`; it does not bypass the system image check.
 
 Cell 2 claims the workspace for this runtime. If another runtime ended without flushing, the error reports a stale lock after 10 minutes; once you are sure that runtime is gone, use `ws.prepare(force_unlock=True)`.
 """),
