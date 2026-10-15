@@ -1,12 +1,12 @@
 # Persistent Colab
 
 ## Purpose
-Provide a general Python/AI workspace whose files and saved Python environment
-survive the release of a managed Colab runtime. This does not keep a VM or live
-process alive.
+Provide a general Python/AI workspace whose files, saved Python environment and
+system installation layers survive the release of a managed Colab runtime.
+This does not keep a VM or live process alive.
 
 ## Layout
-- `persistent_colab.py`: Drive-backed workspace and local virtual environment.
+- `persistent_colab.py`: Drive-backed spaces/projects, system layers and local virtual environment.
 - `build_notebook.py`: generates the self-contained `PersistentColab.ipynb`.
 - `README.md`: operation and persistence boundaries.
 - `tests/`: integrity and compatibility checks for environment snapshots.
@@ -15,36 +15,62 @@ process alive.
 - `skills/`: persistent-workspace skill and the official CLI's bundled skill.
 
 ## Operation
-- The private Drive deployment is in `My Drive/PersistentColab` and contains
-  the notebook, helper and README. Update existing files rather than duplicating
-  the deployment; preserve notebook sharing and private-output settings.
-- Persistent root: `/content/drive/MyDrive/PersistentColab/workspaces/<project>`,
-  or `<mount-point>/workspaces/<project>` with `--storage rclone`.
-- Runtime environment: `/content/persistent-colab/<project>/.venv`.
+- The old private Drive deployment in `My Drive/PersistentColab` remains
+  untouched. Do not overwrite its helper/notebook or migrate its data implicitly;
+  preserve sharing and private-output settings. Use current self-contained
+  notebooks for the new layout.
+- Shared data root: `/content/drive/MyDrive/PersistentColabData`, or the mounted
+  remote folder with `--storage rclone`. `drive_root` now means this data root.
+- Persistent project root: `<data-root>/spaces/<space>/workspaces/<project>`.
+  CLI `--space` defaults to `default` and accepts either subcommand position;
+  `spaces -s SESSION` lists existing spaces/projects on mounted storage only.
+- Runtime environment: `/content/persistent-colab/<space>/<project>/.venv`.
+- `Workspace(..., space='default', system=None)` enables system persistence
+  automatically only on real Colab; local fixtures disable it by default.
+  `prepare` restores system before the virtual environment; `save_environment`
+  saves both. System state includes apt/system pip and changes under
+  `/usr` (including `/usr/local`), `/opt`, `/etc`, `/var/lib`, `/root/.local`,
+  excluding volatile paths, known credentials and other mounts. Arbitrary secrets in captured
+  directories are still unsafe; host GPU drivers and running services do not persist.
+- On a fresh VM, mount storage and run `prepare` (CLI `restore`) before any
+  project/system package installation or system-file customization, including
+  first use. The pristine baseline keeps captured deltas and rebuild recipes
+  accurate.
+- System layers require the same base image. On a fresh changed image,
+  `rebuild-system` explicitly reinstalls recorded apt/system pip packages and
+  starts a new chain; `rebuild` retains its virtual-environment meaning.
+  `--allow-base-drift` never bypasses the system image check.
+- `compact` compacts the system chain without deleting old layers. Explicit
+  `prune --keep N` also lists unreferenced system layers and keeps the current
+  chain; deletion requires `--yes`. Never prune automatically.
+- Use one project per VM because system restore changes the whole VM; start a
+  fresh VM to switch projects/spaces after system restoration. Use one snapshot
+  writer per project. Spaces provide directory separation, not access isolation.
 - Use a CPU runtime for setup/verification; request a GPU only for GPU work.
 - Keep credentials and private runtime/Drive metadata out of Git.
 - Snapshot versions are immutable; never prune user snapshots automatically.
 - Run `python3 build_notebook.py` after changing the helper, then
   `python3 -m unittest discover -s tests`.
 - Verify restoration in a genuinely new Colab VM after persistence changes.
-- Verified with two separate CPU VMs: a saved Python package, output file and
-  JSON checkpoint survived release. GPU/CUDA extensions need hardware-specific
-  validation when introduced. Drive authorization may be required for a new VM.
-- A separate Drive notebook, `CrossNotebookVerification.ipynb`, also restored
-  the original project's package, file and checkpoint. A differently named
-  project kept its file, checkpoint and saved-package directories separate,
-  without changing the default project's snapshot. This is directory and
-  environment separation, not a security boundary; use separate kernels when
-  switching projects and one snapshot writer per project.
+- CPU acceptance (2026-10-15) passed across two separately released VMs:
+  apt binary/library, system pip base upgrade with obsolete dist-info removal,
+  custom executable, venv package, durable output/checkpoint, small incremental
+  layer, credential exclusions, second-project refusal and save/flush/stop.
+  The notebook helper used the same rclone root; actual notebook `drive.mount`
+  consent and GPU/CUDA remain untested. Small restores can be slower than
+  installation because scanning and Drive I/O have fixed costs.
+- Colab lacks `CAP_SYS_MODULE`; kernel GPU drivers come from the host. Persist
+  user-space libraries only; validate them on their actual GPU image/hardware.
 - The companion requires an explicit session name. It does not auto-allocate,
   auto-authorize Drive or change official credentials/session-state files.
 - Remote commands use temporary notebooks and structured success receipts:
   official `colab exec` 0.7.4 can return zero after a remote Python error.
   `finish` must not stop a runtime until save and Drive flush confirm success.
-- rclone backend verified on real Google Drive across separate CPU VMs
-  (dedicated `drive.file` remote `colab:PersistentColabRclone`, config
-  `~/.config/rclone/colab.conf`): install, run, finish, restore on a new VM,
-  cross-VM lock refusal, failing run/finish keep the VM, config removal.
+- Shared rclone data root: `colab:PersistentColabData` (server-side renamed
+  from the empty rclone-created `PersistentColabRclone` folder), dedicated
+  `drive.file` config `~/.config/rclone/colab.conf`. Preserve this config.
+  `finish` verifies the venv snapshot, system chain/manifests and image baseline
+  on the remote before unmounting/removing VM credentials and stopping the VM.
   Deleting a file whose rewrite is still queued in rclone's VFS leaves the old
   remote object; wait for uploads before deleting. Colab ships FUSE 2 only, so a `fusermount3` shim is needed;
   the mount must start in a new session or a kernel restart unmounts it.
@@ -52,8 +78,8 @@ process alive.
   unmounted mount point silently writes to VM disk; always check mounts first.
   Config contents must never enter exec code: `colab log` stores it.
 - Official `exec --timeout` is a wall-clock deadline; 0 and `inf` do not work.
-- Colab CPU and T4 base images differ (648 vs 723 packages, different Python
-  patch). The base image already fails `pip check` (ipython/jedi).
+- CPU and GPU images differ. Existing base-image `pip check` conflicts must
+  remain separate from new workspace conflicts.
 - Public repository: `https://github.com/jamie950315/persistent-colab`, branch `main`.
 - Install from a local checkout with `uv tool install --editable .`.
   Installed skill directories in `~/.codex/skills` link to the tracked `skills/`.

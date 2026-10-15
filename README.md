@@ -2,13 +2,13 @@
 
 A general Python/AI workspace stored in Google Drive. Releasing a managed Colab
 runtime releases its VM; reopening the notebook restores durable files and the
-last saved Python environment into a new runtime.
+last saved Python and system environments into a compatible new runtime.
 
 ## Use
 
-1. Open `PersistentColab.ipynb` in Colab. Use CPU unless the task needs a GPU.
-2. Run **Mount Google Drive**, then **Restore workspace and Python environment**.
-3. Keep the same `PROJECT` name to continue the same workspace.
+1. Open the current `PersistentColab.ipynb` from this checkout in Colab. Use CPU unless the task needs a GPU.
+2. On a fresh VM, run **Mount Google Drive**, then **Restore workspace, system and Python environments** before installing packages, changing system files or importing project dependencies.
+3. Keep the same `SPACE` and `PROJECT` names to continue the same workspace.
 4. Write durable files under `ws.root`. Install packages using `ws.install(...)`.
 5. Save application/model checkpoints during long jobs.
 6. Run **Save environment**, check **FLUSH_DRIVE**, then run **Flush Drive** when finished.
@@ -17,10 +17,8 @@ last saved Python environment into a new runtime.
    runtimes use different base images; see [Python environment](#python-environment).
 
 ```
-My Drive/PersistentColab/
-  PersistentColab.ipynb
-  persistent_colab.py
-  workspaces/default/
+My Drive/PersistentColabData/
+  spaces/default/workspaces/default/
     src/
     data/
     models/
@@ -30,30 +28,37 @@ My Drive/PersistentColab/
       latest.json
       snapshots/<timestamp>.tar.gz
       snapshots/<timestamp>.json
+      system/<image-id>/latest.json
+      system/<image-id>/layers/<layer-id>.{json,tar.gz}
+  images/<image-id>/baseline.{json,json.gz}
 ```
+
+System snapshots and package recipes are also stored with the project. The old
+`My Drive/PersistentColab` deployment remains untouched; it is not automatically
+migrated or used as the new data root. Use a current self-contained notebook for
+the new layout rather than loading the old deployment's helper.
 
 ## Use from another notebook
 
-Add this initialization cell before importing project packages:
+Generate a current self-contained notebook, or copy its mount and restore cells
+into another notebook. Run them on a fresh VM before installing packages,
+changing system files or importing project dependencies:
 
-```python
-from google.colab import drive
-from pathlib import Path
-
-drive.mount('/content/drive')
-exec(Path('/content/drive/MyDrive/PersistentColab/persistent_colab.py').read_text())
-ws = Workspace('default')
-ws.prepare()
-ws.activate()
+```sh
+colab-workspace notebook --space default -p default -o OtherNotebook.ipynb
 ```
 
-The same project name shares the durable files and saved environment across
-notebooks. A different name creates separate workspace and environment
-directories. Initialize each notebook explicitly; this is not an account-wide
-Colab setting. Keep one writer per project, and use separate kernels for different
-projects to avoid already imported modules carrying over. All projects remain
-accessible to the same Drive account; separate directories are not a security
-boundary.
+The restore cell uses `Workspace(PROJECT, space=SPACE)`. The same space and
+project share durable files and saved environments across notebooks. A different
+space or project selects separate directories under the same shared data root;
+`default` is the default for both names. Names accept 1–64 letters, digits,
+underscores or hyphens, starting with a letter or digit.
+
+Initialize each notebook explicitly; this is not an account-wide Colab setting.
+Use one project per VM because system restoration changes the whole VM, and one
+writer per project. Start a fresh VM to switch projects or spaces after system
+restoration. All spaces remain accessible to the same Drive account; separate
+directories are not a security boundary.
 
 ## Companion CLI and skills
 
@@ -74,14 +79,26 @@ official CLI's defaults remain in effect.
 
 ```sh
 colab new -s development                    # CPU; use --gpu only when needed.
-colab-workspace mount -s development        # Interactive terminal authorization.
-colab-workspace restore -s development -p default
-colab-workspace install -s development -p default 'humanize==4.15.0'
-colab-workspace run -s development -p default -f job.py -- input.csv
-colab-workspace status -s development -p default
-colab-workspace save -s development -p default
-colab-workspace finish -s development -p default
+colab-workspace --storage rclone mount-rclone -s development \
+  --conf ~/.config/rclone/colab.conf --remote colab:PersistentColabData
+colab-workspace --storage rclone restore -s development -p default
+colab-workspace --storage rclone install -s development -p default 'humanize==4.15.0'
+colab-workspace --storage rclone run -s development -p default -f job.py -- input.csv
+colab-workspace --storage rclone status -s development -p default
+colab-workspace --storage rclone spaces -s development
+colab-workspace --storage rclone save -s development -p default
+colab-workspace --storage rclone finish -s development -p default
 ```
+
+The documented CLI workflow uses rclone and the same `PersistentColabData`
+folder as the notebook. For interactive Drive mounting instead, use
+`colab-workspace mount -s development` and `--storage colab-drive` on subsequent
+commands (the CLI's default storage flag). Both routes use the identical layout.
+
+Run `restore` on a fresh VM before installing workspace or system packages or
+changing system files. It calls `ws.prepare()` to record the unmodified image
+baseline before restoring saved state; this keeps saved changes and package
+rebuild recipes accurate.
 
 `restore` and other workspace commands claim `environment/LOCK` for the
 runtime; `flush` and `finish` release it. A command on another runtime fails
@@ -89,15 +106,22 @@ while the lock's heartbeat is fresh. If a runtime disappeared without
 `finish`, the lock turns stale after 10 minutes and the error suggests
 `--force-unlock`. `prune -s SESSION -p PROJECT --keep N` lists older snapshots to delete
 and deletes them only with `--yes`; the newest `N` and the `latest.json`
-snapshot are always kept.
+snapshot are always kept. It also lists unreferenced system layers; layers needed
+by the current system chain are retained.
+
+`--space NAME` can precede or follow any subcommand. For example,
+`colab-workspace --storage rclone --space research restore -s development -p training` and
+`colab-workspace --storage rclone restore -s development --space research -p training` select the
+same workspace. `spaces -s SESSION` lists existing spaces and their projects
+using the VM's mounted storage; it does not mount, create or allocate anything.
 
 `run` uses an independent workspace Python process, passes script arguments and
 its exit code, and sets the durable workspace as cwd. Imports can use `src/` and
 the workspace root. Only the specified script is transferred; upload source or
 data dependencies separately with official `colab upload`.
 
-`finish` saves the Python environment, flushes/unmounts Drive and releases only
-the named VM after a structured success receipt. Save application checkpoints
+`finish` saves both system and Python environments, flushes/unmounts Drive and
+releases only the named VM after a structured success receipt. Save application checkpoints
 beforehand. A remote Python error, timeout or missing receipt leaves the VM
 running for inspection, even when the official `colab exec` exits zero.
 `--timeout` is a wall-clock limit enforced by the official CLI; it accepts no
@@ -105,7 +129,11 @@ unlimited value. `run` defaults to 86400 seconds (Colab's maximum session
 length) and other commands to 600. A local timeout does not stop the remote
 process: check `colab status` and `colab log -s SESSION` and wait for it to
 finish rather than repeating the command. `flush` only releases the lock and
-unmounts storage. `rebuild` explicitly reinstalls saved requirements on a fresh changed image.
+unmounts storage. `rebuild` explicitly reinstalls saved virtual-environment
+requirements. On a fresh changed image, use `rebuild-system` to reinstall the
+recorded apt/system pip packages and start a new system chain before rebuilding
+the virtual environment. `compact` compacts the current system layers; old
+layers remain until an explicit `prune --yes`.
 
 ## Unattended operation with rclone
 
@@ -115,12 +143,12 @@ run the whole cycle without interaction:
 
 ```sh
 set -e
-W="colab-workspace --storage rclone --mount-point /mnt/pc"
+workspace() { colab-workspace --storage rclone --mount-point /mnt/pc --space research "$@"; }
 colab new -s nightly
-$W mount-rclone -s nightly --conf ~/.config/rclone/colab.conf --remote colab:PersistentColabRclone
-$W restore -s nightly -p training
-$W run -s nightly -p training -f train.py -- --epochs 3
-$W finish -s nightly -p training
+workspace mount-rclone -s nightly --conf ~/.config/rclone/colab.conf --remote colab:PersistentColabData
+workspace restore -s nightly -p training
+workspace run -s nightly -p training -f train.py -- --epochs 3
+workspace finish -s nightly -p training
 ```
 
 - `mount-rclone` validates the local config and remote name before any remote
@@ -130,12 +158,14 @@ $W finish -s nightly -p training
   a private `fusermount3` shim is used. The daemon runs in its own session and
   survives `colab exec` calls and kernel restarts. The config contents never
   appear in generated exec code, which the official CLI keeps in `colab log`.
-- With `--storage rclone`, workspaces live at `<mount-point>/workspaces/<project>`.
-  The storage options can also follow the subcommand.
+- With `--storage rclone`, the mounted remote is the shared data root. Workspaces
+  live at `<mount-point>/spaces/<space>/workspaces/<project>`. The storage and
+  space options can also follow workspace subcommands.
 - `flush`/`finish` release the workspace lock once pending uploads have
   drained, wait for rclone's upload queue to empty, confirm this runtime's lock
   is gone from the remote, read `latest.json` back and compare the archive's
-  size and MD5, unmount, then delete every copy of the config. Only then is a receipt sent,
+  size and MD5. System pointers, every referenced layer/manifest and the
+  image baseline are verified too. It then unmounts and deletes every copy of the config. Only then is a receipt sent,
   and `finish` stops the VM only after that receipt. Any failure leaves the
   VM running, mounted and still able to retry.
 - A non-zero `run` stops a `set -e` script before `finish`; the VM keeps
@@ -157,20 +187,23 @@ this purpose:
    `drive.file` only reaches files this rclone client created, so the token
    cannot read the rest of your Drive.
 3. Use a folder rclone will create itself, such as
-   `colab:PersistentColabRclone`. A `drive.file` token cannot see the existing
+   `colab:PersistentColabData`. A `drive.file` token cannot see the existing
    `PersistentColab` folder made through Colab, and Drive allows two folders
    with the same name, so do not reuse that name.
 
 Notebooks that use `drive.mount` see the rclone folder at
-`/content/drive/MyDrive/PersistentColabRclone`; pass its `workspaces`
-directory to `Workspace(PROJECT, Path('/content/drive/MyDrive/PersistentColabRclone/workspaces'))`.
+`/content/drive/MyDrive/PersistentColabData` when that is the actual remote folder.
+`Workspace(PROJECT, space=SPACE)` uses this default data root. For a differently
+named folder, pass the folder itself with `drive_root=Path('/content/drive/MyDrive/FOLDER')`,
+not its `spaces` or `workspaces` subdirectory. The same Drive folder must be
+visible to both clients; matching folder names alone do not prove object identity.
 A `scope=drive` remote with `root_folder_id` limits which folder rclone shows,
 but its token can still access the whole Drive.
 
 Generate a self-contained notebook locally without allocating a runtime:
 
 ```sh
-colab-workspace notebook -p training -o training.ipynb
+colab-workspace notebook --space research -p training -o training.ipynb
 ```
 
 Existing output files are never overwritten. Skills under `skills/` can be
@@ -197,7 +230,7 @@ directories are preserved: the installer fails rather than replacing them.
 
 ## Python environment
 
-Packages execute from `/content/persistent-colab/<project>/.venv`, using a virtual
+Packages execute from `/content/persistent-colab/<space>/<project>/.venv`, using a virtual
 environment with Colab's preinstalled packages available. Additional packages
 and their executable scripts are archived on Drive. On the next compatible
 runtime, a fresh virtual environment is created and the saved archive is
@@ -206,8 +239,10 @@ verified and restored locally. Running binaries directly on Drive is avoided.
 `ws.install('package==version')` saves a new snapshot immediately. Ordinary
 notebook imports use the restored package directories after `ws.activate()`.
 For imports already present in the kernel, use `ws.run(code)` or restart the
-kernel and bootstrap again. `%pip` and `!pip` do not target this environment;
-use `ws.install` for persistence. A failed install is not committed.
+kernel and bootstrap again. `%pip` and `!pip` target the system environment,
+rather than the workspace virtual environment; save their changes with
+`ws.save_environment()` or `colab-workspace save`. Use `ws.install` for workspace
+packages and immediate saving. A failed `ws.install` is not committed.
 
 Snapshots inherit the base image's Python packages, so Python major/minor,
 architecture, libc and base package versions must match. A changed Colab image
@@ -218,11 +253,9 @@ runs `pip check`; any conflict not already present in the base image removes
 the restored environment again. Python, architecture or libc changes always
 fail. Snapshots from before this list existed keep the strict check.
 
-CPU and GPU runtimes do not share a base image. Measured on the same day: a CPU
-runtime had 648 packages, a T4 runtime 723 (RAPIDS/CUDA additions, different
-`dask` versions) and a different Python patch release. An environment saved on
-CPU therefore fails the strict check on a GPU runtime. Keep separate projects
-per runtime type, or use `--allow-base-drift` and rely on its `pip check`. `ws.rebuild()` on a fresh runtime reinstalls the
+CPU and GPU runtimes do not share a base image. Keep separate spaces or projects
+per runtime type. `--allow-base-drift` only relaxes the virtual environment's
+base-package check; it cannot override a system image mismatch. `ws.rebuild()` on a fresh runtime reinstalls the
 snapshot's frozen added-package versions and saves a new snapshot. Original
 snapshots remain intact. CUDA extensions and device-specific compiled packages
 may still require rebuilding when hardware, drivers or CUDA change. No GPU
@@ -232,18 +265,90 @@ Versioned index packages are supported. Editable/local/direct-URL packages are
 not snapshot recipes: save project source in `src/` and keep setup cells in the
 notebook. Secrets must use Colab Secrets; tokens are not intentionally archived.
 
+## System environment
+
+In real Colab VMs, `ws.prepare()` restores the saved system before preparing the
+virtual environment. `ws.save_environment()` saves both. System persistence is
+enabled automatically only in real Colab; local fixtures disable it by default.
+The `system` constructor option explicitly controls this behavior.
+
+On each fresh VM, mount storage and call `ws.prepare()` before installing
+packages or changing system files, including the first time a project is used.
+The initial baseline must describe the unmodified Colab image so your changes
+are included in saved layers and package rebuild recipes.
+
+The system snapshot records apt and system pip package differences plus new or
+modified files under `/usr` (including `/usr/local`), `/opt`, `/etc`, `/var/lib`
+and `/root/.local`. Capture uses ctime relative to PID 1 start on the root
+filesystem, without following symlinks or crossing devices/bind mounts. A
+per-image baseline path manifest records deletions, including obsolete dist-info
+directories after system pip upgrades.
+Volatile paths, known credential locations and other mounts are excluded.
+This is not a secret detector: do not put arbitrary credentials into captured
+directories. Services' configuration may persist, but their running processes
+and the host GPU driver are not preserved. Colab containers lack
+`CAP_SYS_MODULE`: kernel drivers come from the host and cannot be installed or
+restored here. User-space CUDA/cuDNN/TensorRT files in captured roots are
+included, but need validation on their actual GPU image and hardware.
+
+System layers belong to a specific base image. An image mismatch fails explicitly;
+on a fresh VM use `ws.rebuild_system()` (CLI `rebuild-system`) to reinstall the
+recorded apt/system pip packages and begin a new chain. Arbitrary filesystem
+changes from the old image are not replayed onto the new image: keep the setup
+needed to reproduce them in source control. Then use `ws.rebuild()` (CLI
+`rebuild`) for the saved virtual-environment requirements. Reinstallation can
+fail if old package versions are unavailable or incompatible. Old chains remain
+until explicitly pruned.
+
+Each save writes only files changed since the previous save/restore, plus
+deletions, into an immutable gzip layer and manifest. `pigz` is used when
+available. SHA-256 readback precedes pointer publication; restore verifies the
+complete chain before applying any layer and runs no apt/pip installer. Save
+metadata records compressed bytes and duration; restore metrics also appear in
+`ws.local / 'system-restore.json'` and console output. An interrupted filesystem
+apply requires a fresh VM. Keep sufficient local disk for the chain archives
+and extracted files.
+
+`ws.compact()` (CLI `compact`) combines the current system layers without deleting
+old layers. `prune --keep N` is a dry run that includes unreferenced system
+layers; `--yes` is required to delete. The current system chain is always kept.
+
+CPU acceptance on 2026-10-15 used two genuinely separate, released VMs and the
+shared rclone data root. VM A installed `cowsay`, `libxxhash-dev`, system
+`pyfiglet`, upgraded base `wrapt` 2.5.0 to 2.5.1, added an executable under
+`/usr/local/bin`, and installed venv `pyjokes`. VM B restored and used all of
+them without package installation; the old wrapt dist-info directory was gone.
+A durable output/checkpoint survived, `beta` remained absent, and a second
+project's system restore was refused. Credential/runtime paths were excluded
+from every layer. Notebook initialization used the same helper against the
+rclone mount; interactive `drive.mount` in an actual notebook was not run.
+
+Measured compressed sizes/times: first system save 4,068,575 bytes / 18.483s;
+VM B restore of two layers 4,068,655 bytes / 59.287s; adding a 24-byte file
+produced a 546-byte incremental layer / 18.72s. The initial image baseline was
+1,979,753 compressed bytes. The small apt/system pip installation took 17.05s
+including apt update, so this small workload restored more slowly: full
+filesystem scanning, validation and Drive I/O have fixed costs. Filesystem scans and Drive I/O still contribute to startup latency.
+
+GPU/CUDA and hardware-specific libraries remain untested. Image migration via
+`rebuild-system`, compaction, corruption/deletion handling and remote finish
+gates have local fake-filesystem/transport tests; CPU restore and finish also
+have the live evidence above. Host kernel drivers cannot be installed or restored.
+
 ## Persistence boundaries
 
 | Item | Behavior after releasing a runtime |
 | --- | --- |
 | Notebook, source and files saved on Drive | Remain on Drive |
 | Added Python packages saved in a snapshot | Restored on a compatible new VM |
+| Saved apt/system pip state and captured system files | Restored on the same base image; explicit package rebuild on a new image |
 | Colab base libraries | Provided by the new VM; changes are detected |
 | Model files in configured Hugging Face/Torch cache | Remain on Drive |
 | Complete training checkpoints | Can resume if the training code supports it |
 | RAM variables, GPU memory, executing processes | Lost |
 | Unsaved files under `/content` | Lost |
-| apt packages, OS services, drivers | Rerun explicit setup cells |
+| Running OS services and host GPU drivers | Not preserved |
+| Volatile paths, known credential locations and other mounted filesystems | Excluded from system snapshots; save durable data explicitly |
 
 `HF_HUB_CACHE` and `TORCH_HOME` point into the workspace on Drive. Neither
 Drive's FUSE mount nor rclone's mount supports symlinks, so `huggingface_hub`
