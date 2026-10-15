@@ -80,9 +80,11 @@ VM, and one writer per project. Use a fresh VM to switch projects/spaces after
 system restoration. Names use 1–64 letters, digits, underscores or hyphens,
 starting with a letter or digit.
 
-The old `My Drive/PersistentColab` deployment stays untouched. Generate a current
-notebook rather than loading that deployment's old helper. Do not migrate or
-rename old data without the task's explicit authorization.
+The private `My Drive/PersistentColab` notebook, helper and README were updated
+in place on 2026-10-15, preserving file IDs and sharing. Re-sync them after
+helper/notebook changes; the controller handles interactive Drive mount consent.
+Preserve private-output settings and existing data; do not migrate or rename data
+without explicit authorization.
 
 ## Persistence and recovery boundaries
 
@@ -130,8 +132,13 @@ rename old data without the task's explicit authorization.
   `/usr/local/bin` executable, venv package, output/checkpoint, small incremental
   layer, credential exclusion and save/flush/stop. The notebook helper used the
   same rclone root; actual notebook Drive consent was not exercised. Small
-  environments may restore more slowly than installation because of scanning
-  and Drive I/O. GPU/CUDA needs validation on the actual workload/hardware.
+  environments can still restore more slowly than installation. Fresh CPU
+  measurements: 4.07 MB/4 layers restore 30.25s (prepare 34.78s) versus 17.05s
+  install; 1.47 GB gzip restore 123.67s (prepare 128.69s) versus 333.11s install,
+  dominated by a 250.75s source build. Size alone is not a break-even rule.
+  Inspect `ws.local / 'system-restore.json'`, `system-save.json` and `prepare.json`
+  for phases. The next save still scans all roots; only restore's tracking-state
+  scan was removed. GPU execution needs validation on actual hardware.
 - Colab lacks `CAP_SYS_MODULE`; host kernel drivers cannot be installed here.
   User-space CUDA/cuDNN/TensorRT files in captured roots are saved, but CPU
   acceptance does not prove GPU compatibility.

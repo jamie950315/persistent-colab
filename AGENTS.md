@@ -15,10 +15,11 @@ This does not keep a VM or live process alive.
 - `skills/`: persistent-workspace skill and the official CLI's bundled skill.
 
 ## Operation
-- The old private Drive deployment in `My Drive/PersistentColab` remains
-  untouched. Do not overwrite its helper/notebook or migrate its data implicitly;
-  preserve sharing and private-output settings. Use current self-contained
-  notebooks for the new layout.
+- The private Drive deployment in `My Drive/PersistentColab` was updated in place
+  on 2026-10-15 with the current notebook, helper and README (same file IDs and
+  sharing). Re-sync these files after helper/notebook changes; preserve sharing,
+  private-output settings and existing data. The controller handles the one
+  interactive Drive mount consent required on a VM.
 - Shared data root: `/content/drive/MyDrive/PersistentColabData`, or the mounted
   remote folder with `--storage rclone`. `drive_root` now means this data root.
 - Persistent project root: `<data-root>/spaces/<space>/workspaces/<project>`.
@@ -57,8 +58,20 @@ This does not keep a VM or live process alive.
   custom executable, venv package, durable output/checkpoint, small incremental
   layer, credential exclusions, second-project refusal and save/flush/stop.
   The notebook helper used the same rclone root; actual notebook `drive.mount`
-  consent and GPU/CUDA remain untested. Small restores can be slower than
-  installation because scanning and Drive I/O have fixed costs.
+  consent and GPU execution remain untested. Restore performance (2026-10-15,
+  fresh CPU VMs): 4.07 MB/4 layers fell from 62.02s to 30.25s (prepare 34.78s),
+  versus the earlier 17.05s install. A 2.37 GB file payload/1.47 GB gzip restored
+  in 123.67s (prepare 128.69s) versus 333.11s install, including a 250.75s lxml
+  source build. Save took 127.96s plus Drive flush. A later save was 447 bytes.
+  Boost/lxml and CUDA user-space load/version checks passed on CPU. Budget about
+  35s startup for the small chain or 130s for that large payload; size alone is
+  not a break-even rule. See README for phases, timing scope and limitations.
+- Restore tracking state uses verified baseline/layer paths, fingerprints for
+  layer-written paths, and a local filesystem ctime checkpoint for untouched
+  image paths. The next save still scans all roots; equal clock ticks count as
+  changed. Reject pre-restore directory-to-symlink drift if it would create
+  inconsistent deletions. Restore/save phase metrics live in `system-restore.json`
+  and `system-save.json` under `ws.local`; `prepare.json` covers surrounding work.
 - Colab lacks `CAP_SYS_MODULE`; kernel GPU drivers come from the host. Persist
   user-space libraries only; validate them on their actual GPU image/hardware.
 - The companion requires an explicit session name. It does not auto-allocate,

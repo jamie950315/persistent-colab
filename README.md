@@ -33,10 +33,12 @@ My Drive/PersistentColabData/
   images/<image-id>/baseline.{json,json.gz}
 ```
 
-System snapshots and package recipes are also stored with the project. The old
-`My Drive/PersistentColab` deployment remains untouched; it is not automatically
-migrated or used as the new data root. Use a current self-contained notebook for
-the new layout rather than loading the old deployment's helper.
+System snapshots and package recipes are also stored with the project. The
+private `My Drive/PersistentColab` notebook, helper and README were updated in
+place on 2026-10-15, preserving file IDs and sharing. Re-sync those files after
+helper/notebook changes and preserve private-output settings. The controller
+handles interactive Drive mount consent. Existing data is not migrated or used
+as the new data root automatically.
 
 ## Use from another notebook
 
@@ -304,10 +306,22 @@ Each save writes only files changed since the previous save/restore, plus
 deletions, into an immutable gzip layer and manifest. `pigz` is used when
 available. SHA-256 readback precedes pointer publication; restore verifies the
 complete chain before applying any layer and runs no apt/pip installer. Save
-metadata records compressed bytes and duration; restore metrics also appear in
-`ws.local / 'system-restore.json'` and console output. An interrupted filesystem
-apply requires a fresh VM. Keep sufficient local disk for the chain archives
+metadata records compressed bytes, duration and phase timings. Restore metrics
+appear in `ws.local / 'system-restore.json'`; save metrics are returned and also
+written to `ws.local / 'system-save.json'`. Both print phase seconds. The restore
+report includes surrounding prepare, base-package signature and venv timings;
+`ws.local / 'prepare.json'` also records these. Repeated prepare calls explicitly
+report `already_applied` rather than reuse an earlier restore duration. An
+interrupted filesystem apply requires a fresh VM. Keep sufficient local disk for the chain archives
 and extracted files.
+
+Restore derives its local tracking state from the verified baseline and layer
+manifests, reading fingerprints only for paths written by the chain. Untouched
+image paths use a local ctime checkpoint; the next save still scans all system
+roots and detects later content/metadata changes, additions and deletions,
+including writes that preserve mtime. Unknown runtime-created files remain new.
+A directory-to-symlink change made before restore is rejected at save if it
+would create inconsistent deletions. Prepare on a fresh VM before customizing it.
 
 `ws.compact()` (CLI `compact`) combines the current system layers without deleting
 old layers. `prune --keep N` is a dry run that includes unreferenced system
@@ -323,17 +337,60 @@ project's system restore was refused. Credential/runtime paths were excluded
 from every layer. Notebook initialization used the same helper against the
 rclone mount; interactive `drive.mount` in an actual notebook was not run.
 
-Measured compressed sizes/times: first system save 4,068,575 bytes / 18.483s;
-VM B restore of two layers 4,068,655 bytes / 59.287s; adding a 24-byte file
-produced a 546-byte incremental layer / 18.72s. The initial image baseline was
-1,979,753 compressed bytes. The small apt/system pip installation took 17.05s
-including apt update, so this small workload restored more slowly: full
-filesystem scanning, validation and Drive I/O have fixed costs. Filesystem scans and Drive I/O still contribute to startup latency.
+### Restore performance
 
-GPU/CUDA and hardware-specific libraries remain untested. Image migration via
-`rebuild-system`, compaction, corruption/deletion handling and remote finish
-gates have local fake-filesystem/transport tests; CPU restore and finish also
-have the live evidence above. Host kernel drivers cannot be installed or restored.
+Measured on 2026-10-15 using separate fresh Standard CPU VMs, the same image
+and rclone storage. Times start after mounting storage and exclude CLI transport,
+allocation and mounting. Full prepare means `ws.prepare()`, excluding workspace
+constructor directory setup. Small installation time is the earlier CPU
+acceptance measurement; both small restores used the same 4-layer chain.
+
+| Workload | Captured files / gzip | Plain installation | System restore | Full prepare |
+| --- | --- | --- | --- | --- |
+| Small apt/system pip example | 4.07 MB gzip, 4 layers | 17.05s | 30.25s | 34.78s |
+| Boost + CUDA wheels + source-built lxml | 2.37 GB / 1.47 GB, 1 layer | 333.11s | 123.67s | 128.69s |
+
+Small restore phase seconds before and after the optimization:
+
+| Phase | Before | After |
+| --- | ---: | ---: |
+| Baseline load/check | 8.90 | 6.41 |
+| Layer manifests | 9.21 | 5.23 |
+| Archive copy/check/validation | 16.89 | 12.18 |
+| Apply + ldconfig | 2.91 | 3.13 |
+| Tracking state scan / derivation | 20.57 | 0.44 |
+| Tracking state write | 2.52 | 0.71 |
+| **System total, including other overhead** | **62.02** | **30.25** |
+
+The unused pre-restore `pip list` (1.96s) is also gone. Post-restore signature
+and venv work remain; full prepare fell from 66.48s to 34.78s, excluding that
+former initialization call. Checksums, complete-chain validation, extraction
+safety and the next save's full scan remain enabled.
+
+The large workload installed `libboost-all-dev`, `libxml2-dev`, `libxslt1-dev`
+(108 apt package changes), `nvidia-cudnn-cu12==9.10.2.21` with cuBLAS 12.9.2.10
+and NVRTC 12.9.86, and built `lxml==6.0.2` from source. apt update/install took
+38.24s, wheels 44.11s, source build 250.75s. System save took 127.96s (scan
+23.42s, archive 66.91s, copy/readback 18.89s); asynchronous Drive flush is extra.
+Large restore spent 57.66s copying/checking/validating, 53.17s applying,
+4.63s loading the baseline, 2.26s on manifests, 2.73s in ldconfig and 1.13s
+building/writing tracking state. Boost compiled/linked/ran, lxml parsed XML/XPath,
+and cuDNN/NVRTC version calls and cuBLAS loading passed. A later save captured
+only 447 bytes, not the restored gigabytes.
+
+Allow roughly **30s fixed startup cost for a small 4-layer chain**, or **35s
+including Python preparation**: a 17s install still wins. For the measured
+2.37 GB payload (1.47 GB compressed), the break-even installation time was about
+**130s**. There is no universal size threshold: apt plus these large wheels alone
+took only 82.34s; the expensive source build made restoration worthwhile. Layer
+count, Drive latency, compression and installation work matter. Saving is an
+additional one-time cost. These are single-run measurements, not a throughput
+guarantee; the first baseline creation on a new image also scans the filesystem.
+
+GPU execution remains untested; loading CUDA user-space libraries on CPU does
+not validate kernels, device compatibility or host drivers. Image migration,
+compaction, corruption/deletion handling and finish gates also have local
+filesystem/transport tests. Host kernel drivers cannot be installed or restored.
 
 ## Persistence boundaries
 
