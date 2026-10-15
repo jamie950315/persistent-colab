@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import sys
 import tarfile
@@ -28,6 +29,8 @@ if args[:2] == ['rc', 'vfs/stats']:
     states = json.loads(queue.read_text())
     queue.write_text(json.dumps(states[1:] or states))
     print(json.dumps({'diskCache': states[0]}))
+elif args[0] == 'lsf':
+    print('\\n'.join(p.name for p in local(args[-1]).iterdir() if p.is_file()))
 elif args[0] == 'cat':
     sys.stdout.write(local(args[1]).read_text())
 elif args[0] == 'lsjson':
@@ -101,6 +104,33 @@ class RcloneTest(unittest.TestCase):
         self.assertFalse(self.config.exists() or backup.exists() or self.state.exists())
         # The second vfs/stats response (idle) was consumed after the busy one.
         self.assertEqual(len(json.loads(self.stats.read_text())), 1)
+
+    def test_lock_release_waits_for_queued_rewrite(self):
+        # A queued rewrite makes rclone keep the old remote object if deleted now.
+        self.workspace.prepare()
+        self.stats.write_text(json.dumps([
+            {"uploadsInProgress": 0, "uploadsQueued": 1, "erroredFiles": 0},
+            {"uploadsInProgress": 0, "uploadsQueued": 0, "erroredFiles": 0}]))
+        lock = self.workspace.env_dir / "LOCK"
+        unlink = Path.unlink
+        def checked_unlink(path, *args, **kwargs):
+            if path == lock:
+                self.assertEqual(len(json.loads(self.stats.read_text())), 1, "deleted before uploads drained")
+            return unlink(path, *args, **kwargs)
+        with patch.object(Path, "unlink", checked_unlink):
+            persistent_colab.release_lock(self.workspace.root)
+        self.assertFalse(lock.exists())
+
+    def test_own_lock_left_on_remote_blocks_flush(self):
+        remote = self.root / "remote"
+        shutil.copytree(self.mount, remote)
+        lock = json.loads((self.workspace.env_dir / "LOCK").read_text())
+        (remote / "workspaces" / "demo" / "environment" / "LOCK").write_text(json.dumps(lock))
+        persistent_colab.release_lock(self.workspace.root)
+        with patch.dict(os.environ, {"FAKE_REMOTE_ROOT": str(remote)}):
+            with self.assertRaisesRegex(RuntimeError, "lock is still on the remote"):
+                flush_rclone([self.workspace.root])
+        self.assertTrue(self.mounted.exists() and self.config.exists())
 
     def test_remote_pointer_mismatch_keeps_mount_and_credentials(self):
         remote = self.root / "remote"

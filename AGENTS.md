@@ -41,8 +41,12 @@ process alive.
 - Remote commands use temporary notebooks and structured success receipts:
   official `colab exec` 0.7.4 can return zero after a remote Python error.
   `finish` must not stop a runtime until save and Drive flush confirm success.
-- rclone backend (verified on a real CPU VM with an alias remote, not yet with
-  Google Drive): Colab ships FUSE 2 only, so a `fusermount3` shim is needed;
+- rclone backend verified on real Google Drive across separate CPU VMs
+  (dedicated `drive.file` remote `colab:PersistentColabRclone`, config
+  `~/.config/rclone/colab.conf`): install, run, finish, restore on a new VM,
+  cross-VM lock refusal, failing run/finish keep the VM, config removal.
+  Deleting a file whose rewrite is still queued in rclone's VFS leaves the old
+  remote object; wait for uploads before deleting. Colab ships FUSE 2 only, so a `fusermount3` shim is needed;
   the mount must start in a new session or a kernel restart unmounts it.
   `/tmp` upload paths are absolute (the Jupyter root is `/`). Writing into an
   unmounted mount point silently writes to VM disk; always check mounts first.

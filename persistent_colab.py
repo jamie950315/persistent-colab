@@ -161,6 +161,11 @@ def release_lock(root):
             thread.stop.set()
             thread.join()
     if path.exists() and not lock_held_elsewhere(root):
+        state = rclone_state()
+        if state and path.resolve().is_relative_to(Path(state["mount_point"]).resolve()):
+            # Deleting a file whose rewrite is still queued drops only the queued
+            # upload; the previous object would stay on the remote.
+            wait_rclone_uploads(state)
         path.unlink()
 
 
@@ -291,29 +296,42 @@ def _md5(path):
     return digest.hexdigest()
 
 
+def wait_rclone_uploads(state, timeout=1800, poll=2):
+    """Block until the rclone VFS has no queued or running uploads."""
+    url = "http://" + state["rc"] + "/"
+    deadline = time.monotonic() + timeout
+    while True:
+        cache = json.loads(_rclone("rc", "vfs/stats", "--url", url, config=state["config"]).stdout)["diskCache"]
+        if cache.get("erroredFiles"):
+            raise RuntimeError(f"rclone reports {cache['erroredFiles']} file(s) that failed to upload; see {RCLONE_LOG}.")
+        if cache["uploadsInProgress"] == 0 and cache["uploadsQueued"] == 0:
+            return
+        if time.monotonic() > deadline:
+            raise RuntimeError("Timed out waiting for rclone uploads; the remote is still mounted.")
+        time.sleep(poll)
+
+
 def flush_rclone(workspace_roots=(), timeout=1800, poll=2):
-    """Wait for VFS uploads, verify snapshot pointers remotely, unmount and delete the config."""
+    """Wait for VFS uploads, verify the remote copy, unmount and delete the config."""
     state = rclone_state()
     if state is None:
         raise RuntimeError("No rclone mount was created by colab-workspace on this runtime.")
     mount_point = Path(state["mount_point"]).resolve()
     config = Path(state["config"])
-    url = "http://" + state["rc"] + "/"
     deadline = time.monotonic() + timeout
-    while True:
-        cache = json.loads(_rclone("rc", "vfs/stats", "--url", url, config=config).stdout)["diskCache"]
-        if cache.get("erroredFiles"):
-            raise RuntimeError(f"rclone reports {cache['erroredFiles']} file(s) that failed to upload; see {RCLONE_LOG}.")
-        if cache["uploadsInProgress"] == 0 and cache["uploadsQueued"] == 0:
-            break
-        if time.monotonic() > deadline:
-            raise RuntimeError("Timed out waiting for rclone uploads; the remote is still mounted.")
-        time.sleep(poll)
+    wait_rclone_uploads(state, timeout, poll)
     for root in map(Path, workspace_roots):
+        remote_root = _remote_join(state["remote"], root.relative_to(mount_point))
+        remote_files = _rclone("lsf", "--files-only", _remote_join(remote_root, "environment"),
+                               config=config).stdout.split("\n")
+        if "LOCK" in remote_files:
+            remote_lock = json.loads(_rclone("cat", _remote_join(remote_root, "environment/LOCK"),
+                                             config=config).stdout)
+            if remote_lock.get("host") == socket.gethostname():
+                raise RuntimeError("This runtime's lock is still on the remote; the remote is still mounted.")
         latest = root / "environment" / "latest.json"
         if not latest.exists():
             continue
-        remote_root = _remote_join(state["remote"], root.relative_to(mount_point))
         local_pointer = json.loads(latest.read_text())
         remote_pointer = json.loads(_rclone(
             "cat", _remote_join(remote_root, "environment/latest.json"), config=config).stdout)

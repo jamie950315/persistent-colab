@@ -132,9 +132,10 @@ $W finish -s nightly -p training
   appear in generated exec code, which the official CLI keeps in `colab log`.
 - With `--storage rclone`, workspaces live at `<mount-point>/workspaces/<project>`.
   The storage options can also follow the subcommand.
-- `flush`/`finish` wait for rclone's upload queue to drain, read
-  `latest.json` back from the remote and compare the archive's size and MD5,
-  unmount, then delete every copy of the config. Only then is a receipt sent,
+- `flush`/`finish` release the workspace lock once pending uploads have
+  drained, wait for rclone's upload queue to empty, confirm this runtime's lock
+  is gone from the remote, read `latest.json` back and compare the archive's
+  size and MD5, unmount, then delete every copy of the config. Only then is a receipt sent,
   and `finish` stops the VM only after that receipt. Any failure leaves the
   VM running, mounted and still able to retry.
 - A non-zero `run` stops a `set -e` script before `finish`; the VM keeps
