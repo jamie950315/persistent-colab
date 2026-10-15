@@ -19,7 +19,10 @@ This does not keep a VM or live process alive.
   on 2026-10-15 with the current notebook, helper and README (same file IDs and
   sharing). Re-sync these files after helper/notebook changes; preserve sharing,
   private-output settings and existing data. The controller handles the one
-  interactive Drive mount consent required on a VM.
+  interactive Drive mount consent required on a VM. The first `colab drivemount`
+  after consent has twice failed with "mount failed" (DriveFS could not read the
+  VM's auth user-id); rerunning it on the same VM reuses the grant and succeeds.
+  Overwrite files in place (truncate and write) so file IDs stay unchanged.
 - Shared data root: `/content/drive/MyDrive/PersistentColabData`, or the mounted
   remote folder with `--storage rclone`. `drive_root` now means this data root.
 - Persistent project root: `<data-root>/spaces/<space>/workspaces/<project>`.
