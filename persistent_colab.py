@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from contextlib import contextmanager
 
 
 SYSTEM_ROOTS = ("/usr", "/opt", "/etc", "/var/lib", "/root/.local")
@@ -36,6 +37,26 @@ SYSTEM_EXCLUDES = (
     "/usr/bin/rclone", "/usr/local/bin/rclone", "/etc/pip.conf", "/etc/apt/auth.conf",
     "/etc/apt/auth.conf.d",
 )
+
+
+class PhaseTimer:
+    """Wall-clock seconds for non-overlapping operation phases."""
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.phases = {}
+
+    @contextmanager
+    def phase(self, name):
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.phases[name] = round(time.monotonic() - started, 3)
+
+    def metrics(self):
+        return {"seconds": round(time.monotonic() - self.started, 3),
+                "phases": dict(self.phases)}
 
 
 def valid_name(value, label="Project"):
@@ -579,11 +600,10 @@ class SystemLayer:
         return result
 
     def ensure_baseline(self):
-        if self.baseline is not None:
-            return self.baseline
         if self.baseline_path.exists():
             meta = json.loads((self.baseline_dir / "baseline.json").read_text())
-            if sha256(self.baseline_path) != meta["sha256"]:
+            self.baseline_sha256 = sha256(self.baseline_path)
+            if self.baseline_sha256 != meta["sha256"]:
                 raise RuntimeError("System baseline checksum mismatch.")
             self.baseline = _read_gzip_json(self.baseline_path)
         else:
@@ -597,9 +617,10 @@ class SystemLayer:
             with tempfile.TemporaryDirectory(dir=self.local) as directory:
                 source = Path(directory) / "baseline.json.gz"
                 _write_gzip_json(source, value)
-                self._copy_verified(source, self.baseline_path)
+                self.baseline_sha256 = sha256(source)
+                self._copy_verified(source, self.baseline_path, self.baseline_sha256)
             write_json(self.baseline_dir / "baseline.json", {"image_id": self.image_id,
-                       "sha256": sha256(self.baseline_path)})
+                       "sha256": self.baseline_sha256})
             self.baseline = value
             print(f"System baseline: {len(paths)} paths, {self.baseline_path.stat().st_size} bytes, "
                   f"{time.monotonic() - started:.2f}s; image {self.image_id}.")
@@ -608,8 +629,8 @@ class SystemLayer:
         return self.baseline
 
     @staticmethod
-    def _copy_verified(source, destination):
-        expected = sha256(source)
+    def _copy_verified(source, destination, expected=None):
+        expected = expected or sha256(source)
         with Path(source).open("rb") as incoming, Path(destination).open("xb") as outgoing:
             shutil.copyfileobj(incoming, outgoing, length=8 * 1024 * 1024)
             outgoing.flush()
@@ -658,9 +679,10 @@ class SystemLayer:
                 raise RuntimeError("Repeated system layer in chain.")
             seen.add(layer_id)
             path = self.layers / (layer_id + ".json")
-            if sha256(path) != reference["sha256"]:
+            contents = path.read_bytes()
+            if hashlib.sha256(contents).hexdigest() != reference["sha256"]:
                 raise RuntimeError("System manifest checksum mismatch; no files were restored.")
-            manifest = json.loads(path.read_text())
+            manifest = json.loads(contents)
             if manifest["image_id"] != self.image_id or manifest["id"] != layer_id:
                 raise RuntimeError("System manifest image ID mismatch; no files were restored.")
             if manifest.get("parent") != (result[-1][0]["id"] if result else None):
@@ -719,56 +741,95 @@ class SystemLayer:
             # All names, types and symlink parents were validated before any writes.
             archive.extract(member, path=self.fs, filter="fully_trusted")
 
+    def _restored_paths(self, chain):
+        """Derive image paths and stat only paths written by the verified chain.
+
+        None denotes an untouched image path. On the next full save scan, its
+        ctime must precede the restore checkpoint to remain unchanged. ctime
+        detects content, metadata and link changes even if mtime is preserved.
+        Unknown runtime paths are new, and missing image paths are deletions.
+        """
+        excluded = re.compile(r"^(?:" + "|".join(map(re.escape, SYSTEM_EXCLUDES + tuple(self.mounts))) + r")(?:/|$)")
+        paths = dict.fromkeys(name for name in self.baseline["paths"] if not excluded.match(name))
+        written = set()
+        for manifest, _ in chain:
+            for name in manifest["deleted"]:
+                paths.pop(name, None)
+            written.difference_update(manifest["deleted"])
+            written.update(manifest["files"])
+        for name in written:
+            path = self._safe_destination(name)
+            info = path.lstat()
+            paths[name] = self.fingerprint(info, path)
+        return paths
+
     def restore(self):
-        started = time.monotonic()
+        timer = PhaseTimer()
         if (self.local / "system-restore-failed.json").exists():
             raise RuntimeError("System restore failed on this VM. Start a fresh VM before restoring again.")
-        pointer = self._load_pointer()
-        self._claim()
-        self.ensure_baseline()
-        if pointer and pointer["baseline_sha256"] != sha256(self.baseline_path):
-            raise RuntimeError("System baseline does not match the saved chain; no files were restored.")
+        with timer.phase("pointer_claim"):
+            pointer = self._load_pointer()
+            self._claim()
+        with timer.phase("baseline"):
+            self.ensure_baseline()
+            if pointer and pointer["baseline_sha256"] != self.baseline_sha256:
+                raise RuntimeError("System baseline does not match the saved chain; no files were restored.")
         if self.state_path.exists():
-            state = _read_gzip_json(self.state_path)
+            with timer.phase("local_state"):
+                state = _read_gzip_json(self.state_path)
             if state["image_id"] == self.image_id and state.get("chain") == (pointer or {}).get("chain", []):
+                write_json(self.local / "system-restore.json", {"image_id": self.image_id,
+                           "layers": 0, "bytes": 0, "already_applied": True, **timer.metrics()})
                 return pointer
             raise RuntimeError("Local system state differs from the saved chain. Use a fresh VM.")
         size = 0
-        chain = self._chain(pointer) if pointer else []
+        with timer.phase("manifests"):
+            chain = self._chain(pointer) if pointer else []
         # Validate the complete chain and copy each archive locally before touching /usr.
         self.local.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=self.local) as directory:
             pending = []
-            for manifest, source in chain:
-                target = Path(directory) / source.name
-                shutil.copyfile(source, target)
-                if sha256(target) != manifest["sha256"]:
-                    raise RuntimeError("System layer checksum mismatch; no files were restored.")
-                with tarfile.open(target, "r:gz") as archive:
-                    self._validate_archive(archive, manifest)
-                size += target.stat().st_size
-                pending.append((manifest, target))
+            with timer.phase("copy_verify_validate"):
+                for manifest, source in chain:
+                    target = Path(directory) / source.name
+                    shutil.copyfile(source, target)
+                    if sha256(target) != manifest["sha256"]:
+                        raise RuntimeError("System layer checksum mismatch; no files were restored.")
+                    with tarfile.open(target, "r:gz") as archive:
+                        self._validate_archive(archive, manifest)
+                    size += target.stat().st_size
+                    pending.append((manifest, target))
             try:
-                for manifest, path in pending:
-                    with tarfile.open(path, "r:gz") as archive:
-                        self._apply(archive, manifest)
-                if chain and self.real:
-                    subprocess.run(["ldconfig"], check=True, capture_output=True)
+                with timer.phase("apply"):
+                    for manifest, path in pending:
+                        with tarfile.open(path, "r:gz") as archive:
+                            self._apply(archive, manifest)
+                with timer.phase("ldconfig"):
+                    if chain and self.real:
+                        subprocess.run(["ldconfig"], check=True, capture_output=True)
             except BaseException:
                 # A partial root-filesystem restore cannot be rolled back safely in place.
                 write_json(self.local / "system-restore-failed.json", {"image_id": self.image_id})
                 raise
-        self._write_state(self.scan(), pointer)
-        duration = round(time.monotonic() - started, 3)
+        # Changes after this checkpoint are checked by the next save's full scan.
+        baseline_before_ns = time.time_ns()
+        with timer.phase("state_derive"):
+            paths = self._restored_paths(chain)
+        with timer.phase("state_write"):
+            self._write_state(paths, pointer, baseline_before_ns=baseline_before_ns)
+        metrics = timer.metrics()
+        duration = metrics["seconds"]
         write_json(self.local / "system-restore.json", {"image_id": self.image_id,
-                   "layers": len(chain), "bytes": size, "seconds": duration})
+                   "layers": len(chain), "bytes": size, **metrics})
         print(f"System restored: {len(chain)} layer(s), {size} compressed bytes, "
               f"{duration:.2f}s; image {self.image_id}.")
+        print("System restore phases (seconds):", json.dumps(metrics["phases"], sort_keys=True))
         return pointer
 
-    def _write_state(self, paths, pointer):
-        _write_gzip_json(self.state_path, {"image_id": self.image_id,
-                         "chain": (pointer or {}).get("chain", []), "paths": paths})
+    def _write_state(self, paths, pointer, baseline_before_ns=None, destination=None):
+        _write_gzip_json(destination or self.state_path, {"image_id": self.image_id,
+                         "chain": (pointer or {}).get("chain", []), "paths": paths,
+                         "baseline_before_ns": baseline_before_ns})
 
     def _package_changes(self):
         current = self.inventory()
@@ -776,18 +837,21 @@ class SystemLayer:
                        if self.baseline["packages"][kind].get(name) != version} for kind in ("apt", "pip")}
 
     def save(self, compact=False):
-        started = time.monotonic()
-        self._claim()
-        self.ensure_baseline()
+        timer = PhaseTimer()
+        with timer.phase("baseline_claim"):
+            self._claim()
+            self.ensure_baseline()
         if (self.local / "system-restore-failed.json").exists():
             raise RuntimeError("System restore failed on this VM. Use a fresh VM; saving is disabled.")
         if not self.state_path.exists():
             raise RuntimeError("Prepare system persistence on a fresh VM before saving.")
-        previous = _read_gzip_json(self.state_path)
-        pointer = None if getattr(self, "migrating", False) and not self.latest.exists() else self._load_pointer()
-        if previous.get("chain") != (pointer or {}).get("chain", []):
-            raise RuntimeError("System chain changed since restore; refusing to overwrite it.")
-        current = self.scan()
+        with timer.phase("previous_state"):
+            previous = _read_gzip_json(self.state_path)
+            pointer = None if getattr(self, "migrating", False) and not self.latest.exists() else self._load_pointer()
+            if previous.get("chain") != (pointer or {}).get("chain", []):
+                raise RuntimeError("System chain changed since restore; refusing to overwrite it.")
+        with timer.phase("scan"):
+            current = self.scan()
         if compact:
             effective = set()
             for manifest, _ in self._chain(pointer) if pointer else []:
@@ -798,53 +862,81 @@ class SystemLayer:
             deleted = set(self.baseline["paths"]) - current.keys()
             references = []
         else:
+            def differs(name, info):
+                if name in previous["paths"] and previous["paths"][name] is None:
+                    return info[0] > previous["baseline_before_ns"]
+                return previous["paths"].get(name) != info
             changed = {name for name, info in current.items() if (
-                previous["paths"].get(name) != info and
-                (pointer is not None or info[0] > int(self.start * 1e9)))}
+                differs(name, info) and (pointer is not None or info[0] > int(self.start * 1e9)))}
             # Initial save includes runtime-created system files even if prepare saw them.
             if pointer is None:
                 changed.update(name for name, info in current.items() if info[0] > int(self.start * 1e9))
             deleted = ((set(previous["paths"]) if pointer else set(self.baseline["paths"])) - current.keys())
             references = (pointer or {}).get("chain", [])
+            if pointer and previous.get("baseline_before_ns") is not None:
+                for name in deleted:
+                    for ancestor in map(str, Path(name).parents):
+                        info = current.get(ancestor)
+                        if info is None:
+                            continue
+                        if (not stat.S_ISDIR(info[3]) and ancestor in previous["paths"]
+                                and previous["paths"][ancestor] is None
+                                and info[0] <= previous["baseline_before_ns"]):
+                            raise RuntimeError("System topology changed before restore: " + ancestor +
+                                               ". Start a fresh VM before restoring and saving.")
+                        break
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8]
         self.layers.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=self.local) as directory:
             source = Path(directory) / (stamp + ".tar.gz")
-            # pigz uses multiple CPUs when present; gzip is the Python stdlib implementation.
-            if self.real and shutil.which("pigz"):
-                with source.open("wb") as output:
-                    compressor = subprocess.Popen(["pigz", "-1", "-p", "2"], stdin=subprocess.PIPE, stdout=output)
-                    try:
-                        with tarfile.open(fileobj=compressor.stdin, mode="w|") as archive:
-                            self._archive_files(archive, changed, current)
-                    finally:
-                        compressor.stdin.close()
-                        code = compressor.wait()
-                    if code:
-                        raise RuntimeError("System archive compression failed.")
-            else:
-                with tarfile.open(source, "w:gz", compresslevel=1) as archive:
-                    self._archive_files(archive, changed, current)
+            with timer.phase("archive"):
+                # pigz uses multiple CPUs when present; gzip is the Python stdlib implementation.
+                if self.real and shutil.which("pigz"):
+                    with source.open("wb") as output:
+                        compressor = subprocess.Popen(["pigz", "-1", "-p", "2"], stdin=subprocess.PIPE, stdout=output)
+                        try:
+                            with tarfile.open(fileobj=compressor.stdin, mode="w|") as archive:
+                                self._archive_files(archive, changed, current)
+                        finally:
+                            compressor.stdin.close()
+                            code = compressor.wait()
+                        if code:
+                            raise RuntimeError("System archive compression failed.")
+                else:
+                    with tarfile.open(source, "w:gz", compresslevel=1) as archive:
+                        self._archive_files(archive, changed, current)
+            with timer.phase("packages"):
+                packages = self._package_changes()
             manifest = {"schema": 1, "id": stamp, "image_id": self.image_id,
                         "parent": references[-1]["id"] if references else None,
                         "sha256": sha256(source), "bytes": source.stat().st_size,
                         "files": sorted(changed), "deleted": sorted(deleted),
-                        "packages": self._package_changes(), "created_utc": _utc()}
-            self._copy_verified(source, self.layers / source.name)
+                        "packages": packages, "created_utc": _utc()}
+            with timer.phase("copy_verify"):
+                self._copy_verified(source, self.layers / source.name, manifest["sha256"])
         manifest_path = self.layers / (stamp + ".json")
         write_json(manifest_path, manifest)
         # Read the manifest back too; publish only after every immutable object is verified.
         if json.loads(manifest_path.read_text()) != manifest:
             raise RuntimeError("System manifest readback failed; previous pointer remains current.")
         result = {"schema": 1, "image_id": self.image_id,
-                  "baseline_sha256": sha256(self.baseline_path), "created_utc": manifest["created_utc"],
+                  "baseline_sha256": self.baseline_sha256, "created_utc": manifest["created_utc"],
                   "chain": references + [{"id": stamp, "sha256": sha256(manifest_path)}],
                   "packages": manifest["packages"], "bytes": manifest["bytes"],
-                  "seconds": round(time.monotonic() - started, 3)}
-        write_json(self.latest, result)
-        self._write_state(current, result)
+                  **timer.metrics()}
+        staged = self.local / ("system-state-" + uuid.uuid4().hex + ".json.gz")
+        try:
+            with timer.phase("state_write"):
+                self._write_state(current, result, destination=staged)
+            result.update(timer.metrics())
+            write_json(self.latest, result)
+            os.replace(staged, self.state_path)
+        finally:
+            staged.unlink(missing_ok=True)
+        write_json(self.local / "system-save.json", result)
         print(f"System saved: {len(changed)} paths, {len(deleted)} deletions, {manifest['bytes']} "
               f"compressed bytes, {result['seconds']:.2f}s; {len(result['chain'])} layer(s).")
+        print("System save phases (seconds):", json.dumps(result["phases"], sort_keys=True))
         return result
 
     def _archive_files(self, archive, names, current):
@@ -903,12 +995,15 @@ class Workspace:
         self.env_dir = self.root / "environment"
         self.snapshots = self.env_dir / "snapshots"
         self.latest = self.env_dir / "latest.json"
-        self.signature = runtime_signature()
+        enabled = bool(os.environ.get("COLAB_RELEASE_TAG")) if system is None else system
+        timer = PhaseTimer()
+        with timer.phase("runtime_signature"):
+            self.signature = None if enabled else runtime_signature()
+        self.initialization_metrics = timer.metrics()
         self.activated = False
         for folder in ("src", "data", "models", "outputs", "checkpoints", "environment/snapshots"):
             (self.root / folder).mkdir(parents=True, exist_ok=True)
         self.local.mkdir(parents=True, exist_ok=True)
-        enabled = bool(os.environ.get("COLAB_RELEASE_TAG")) if system is None else system
         self.system = SystemLayer(self.root, self.data_root, self.local) if enabled else None
         # Model files are durable, tokens remain in the ephemeral runtime.
         os.environ["HF_HUB_CACHE"] = str(self.root / "models" / "huggingface")
@@ -917,12 +1012,26 @@ class Workspace:
 
     def prepare(self, restore=True, force_unlock=False, allow_base_drift=False):
         """Claim the workspace, recreate executable paths and restore the latest compatible snapshot."""
-        acquire_lock(self.root, self.session, force_unlock)
+        timer = PhaseTimer()
+        with timer.phase("lock"):
+            acquire_lock(self.root, self.session, force_unlock)
         try:
             if self.system:
-                self.system.restore()
-                self.signature = runtime_signature()
-            return self._prepare(restore, allow_base_drift)
+                with timer.phase("system_restore"):
+                    self.system.restore()
+                with timer.phase("runtime_signature"):
+                    self.signature = runtime_signature()
+            with timer.phase("venv_prepare"):
+                result = self._prepare(restore, allow_base_drift)
+            self.prepare_metrics = {**timer.metrics(), "initialization": self.initialization_metrics}
+            write_json(self.local / "prepare.json", self.prepare_metrics)
+            if self.system:
+                path = self.local / "system-restore.json"
+                if path.exists():
+                    metrics = json.loads(path.read_text())
+                    metrics["prepare"] = self.prepare_metrics
+                    write_json(path, metrics)
+            return result
         except BaseException:
             release_lock(self.root)
             raise

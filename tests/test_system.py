@@ -102,6 +102,102 @@ class SystemTest(unittest.TestCase):
         fresh.save()
         self.assertEqual(json.loads((fresh.layers / (json.loads(fresh.latest.read_text())["chain"][-1]["id"] + ".json")).read_text())["files"], [])
 
+    def test_derived_state_matches_scan_and_next_save_is_exact(self):
+        self.change()
+        self.change("opt/deleted-later", "remove after restore")
+        self.layer.start = (self.fs / "etc/base.conf").stat().st_ctime_ns / 1e9 + 0.000001
+        self.layer.save()
+        self.change("usr/local/bin/custom", "second layer")
+        self.change("opt/removed-by-layer", "temporary")
+        self.layer.save()
+        (self.fs / "opt/removed-by-layer").unlink()
+        self.layer.save()
+        fresh = self.fresh()
+        with patch.object(fresh, "scan", side_effect=AssertionError("restore walked roots")):
+            fresh.restore()
+        from persistent_colab import _read_gzip_json
+        state = _read_gzip_json(fresh.state_path)
+        self.assertEqual(set(state["paths"]), set(fresh.scan()))
+        self.assertIsNone(state["paths"]["/etc/base.conf"])
+        self.assertEqual(state["paths"]["/usr/local/bin/custom"], fresh.scan()["/usr/local/bin/custom"])
+        before = fresh.scan()
+        self.put(fresh.fs, "usr/local/bin/custom", "later edit")
+        self.put(fresh.fs, "opt/new-file", "new")
+        (fresh.fs / "opt/deleted-later").unlink()
+        base = fresh.fs / "etc/base.conf"
+        old = base.stat()
+        base.write_text("edit preserving mtime")
+        os.utime(base, ns=(old.st_atime_ns, old.st_mtime_ns))
+        base.chmod(0o600)
+        (fresh.fs / "usr/local/bin/new-link").symlink_to("custom")
+        current = fresh.scan()
+        expected = {name for name, value in current.items() if before.get(name) != value}
+        saved = fresh.save()
+        manifest = json.loads((fresh.layers / (saved["chain"][-1]["id"] + ".json")).read_text())
+        self.assertEqual(set(manifest["files"]), expected)
+        self.assertEqual(set(manifest["deleted"]), set(before) - set(current))
+        fresh.save()
+        manifest = json.loads((fresh.layers / (json.loads(fresh.latest.read_text())["chain"][-1]["id"] + ".json")).read_text())
+        self.assertEqual(manifest["files"], [])
+        self.assertEqual(manifest["deleted"], [])
+
+    def test_runtime_paths_absent_from_baseline_are_captured_on_next_save(self):
+        self.change()
+        self.layer.save()
+        fresh = self.fresh()
+        self.put(fresh.fs, "opt/runtime-created", "not in image manifest")
+        fresh.restore()
+        saved = fresh.save()
+        manifest = json.loads((fresh.layers / (saved["chain"][-1]["id"] + ".json")).read_text())
+        self.assertIn("/opt/runtime-created", manifest["files"])
+
+    def test_derived_baseline_respects_new_runtime_mounts(self):
+        self.change()
+        self.layer.start = (self.fs / "etc/base.conf").stat().st_ctime_ns / 1e9 + 0.000001
+        self.layer.save()
+        fresh = self.fresh()
+        fresh.mounts.add("/usr/lib/python")
+        fresh.restore()
+        from persistent_colab import _read_gzip_json
+        paths = _read_gzip_json(fresh.state_path)["paths"]
+        self.assertFalse(any(name.startswith("/usr/lib/python/") for name in paths))
+
+    def test_pre_restore_directory_to_symlink_drift_refuses_bad_deletions(self):
+        self.change()
+        self.layer.start = (self.fs / "etc/base.conf").stat().st_ctime_ns / 1e9 + 0.000001
+        self.layer.save()
+        fresh = self.fresh()
+        parent = fresh.fs / "usr/lib/python"
+        shutil.rmtree(parent)
+        parent.symlink_to("elsewhere")
+        fresh.restore()
+        with self.assertRaisesRegex(RuntimeError, "topology changed before restore"):
+            fresh.save()
+
+    def test_pointer_failure_preserves_local_state_for_retry(self):
+        from persistent_colab import write_json, _read_gzip_json
+        self.change()
+        before = _read_gzip_json(self.layer.state_path)
+        def fail_pointer(path, value):
+            if path == self.layer.latest:
+                raise OSError("Drive pointer unavailable")
+            write_json(path, value)
+        with patch("persistent_colab.write_json", side_effect=fail_pointer):
+            with self.assertRaisesRegex(OSError, "Drive pointer"):
+                self.layer.save()
+        self.assertEqual(_read_gzip_json(self.layer.state_path), before)
+        self.layer.save()
+
+    def test_timings_are_recorded_and_baseline_drift_is_not_cached(self):
+        saved = self.layer.save()
+        self.assertIn("scan", saved["phases"])
+        metrics = json.loads((self.layer.local / "system-restore.json").read_text())
+        self.assertIn("state_derive", metrics["phases"])
+        with self.layer.baseline_path.open("ab") as stream:
+            stream.write(b"tampered")
+        with self.assertRaisesRegex(RuntimeError, "baseline checksum"):
+            self.layer.save()
+
     def test_excludes_credentials_runtime_state_volatile_files_and_bind_mounts(self):
         self.change()
         forbidden = ["root/.config/rclone/rclone.conf", "root/.config/colab-workspace/rclone-mount.json",
