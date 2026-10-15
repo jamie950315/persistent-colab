@@ -174,6 +174,23 @@ class SystemTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "topology changed before restore"):
             fresh.save()
 
+    def test_baseline_change_at_checkpoint_clock_tick_is_not_missed(self):
+        from persistent_colab import _read_gzip_json, _write_gzip_json
+        self.change()
+        self.layer.start = (self.fs / "etc/base.conf").stat().st_ctime_ns / 1e9 + 0.000001
+        self.layer.save()
+        fresh = self.fresh()
+        fresh.restore()
+        base = fresh.fs / "etc/base.conf"
+        base.write_text("changed at checkpoint tick")
+        state = _read_gzip_json(fresh.state_path)
+        self.assertIsNone(state["paths"]["/etc/base.conf"])
+        state["baseline_before_ns"] = base.lstat().st_ctime_ns
+        _write_gzip_json(fresh.state_path, state)
+        saved = fresh.save()
+        manifest = json.loads((fresh.layers / (saved["chain"][-1]["id"] + ".json")).read_text())
+        self.assertIn("/etc/base.conf", manifest["files"])
+
     def test_pointer_failure_preserves_local_state_for_retry(self):
         from persistent_colab import write_json, _read_gzip_json
         self.change()

@@ -811,8 +811,10 @@ class SystemLayer:
                 # A partial root-filesystem restore cannot be rolled back safely in place.
                 write_json(self.local / "system-restore-failed.json", {"image_id": self.image_id})
                 raise
-        # Changes after this checkpoint are checked by the next save's full scan.
-        baseline_before_ns = time.time_ns()
+        # Sample the filesystem clock, which can be coarser than time.time_ns().
+        # Save includes equal timestamps so writes in the same clock tick count.
+        with tempfile.TemporaryFile(dir=self.local) as checkpoint:
+            baseline_before_ns = os.fstat(checkpoint.fileno()).st_ctime_ns
         with timer.phase("state_derive"):
             paths = self._restored_paths(chain)
         with timer.phase("state_write"):
@@ -864,7 +866,7 @@ class SystemLayer:
         else:
             def differs(name, info):
                 if name in previous["paths"] and previous["paths"][name] is None:
-                    return info[0] > previous["baseline_before_ns"]
+                    return info[0] >= previous["baseline_before_ns"]
                 return previous["paths"].get(name) != info
             changed = {name for name, info in current.items() if (
                 differs(name, info) and (pointer is not None or info[0] > int(self.start * 1e9)))}
@@ -881,7 +883,7 @@ class SystemLayer:
                             continue
                         if (not stat.S_ISDIR(info[3]) and ancestor in previous["paths"]
                                 and previous["paths"][ancestor] is None
-                                and info[0] <= previous["baseline_before_ns"]):
+                                and info[0] < previous["baseline_before_ns"]):
                             raise RuntimeError("System topology changed before restore: " + ancestor +
                                                ". Start a fresh VM before restoring and saving.")
                         break
