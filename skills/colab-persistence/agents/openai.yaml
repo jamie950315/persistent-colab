@@ -1,4 +1,0 @@
-interface:
-  display_name: "Colab Persistence"
-  short_description: "Restore Drive workspaces across Colab runtimes"
-  default_prompt: "Use $colab-persistence to restore my Drive-backed Python workspace on Colab."

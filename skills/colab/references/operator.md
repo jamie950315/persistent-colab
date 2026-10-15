@@ -1,8 +1,3 @@
----
-name: colab-operator
-description: Operate Google Colab environments via the `colab` CLI. Use when asked to create or manage GPU/TPU sessions, run Python/shell on a remote Colab VM, sync files, automate environment setup (packages, auth, Drive), or export session history.
----
-
 # Skill: Colab Session Operator
 
 ## Local release notes
@@ -12,7 +7,7 @@ On this Mac, live `colab --help` reports **oauth2** as the authentication defaul
 and the existing login is verified. Reuse it; do not replace it with ADC merely
 because the bundled authentication section below describes ADC as the default.
 The installed CLI's help takes precedence over bundled examples. For Drive-backed
-workspace persistence, use the companion `colab-persistence` skill and
+workspace persistence, use the persistence reference and
 `colab-workspace`; ordinary `colab install` does not save its packages.
 
 Operate Google Colab environments via the `colab` CLI: provision GPU/TPU sessions, run Python/shell on the VM, sync files, and capture work as notebooks.
@@ -88,10 +83,10 @@ by running `uv tool install google-colab-cli` or `pip install google-colab-cli`.
 - `colab skill` / `colab readme` print this skill and the README (handy for self-discovery).
 
 ## Safety
-- **Always `colab stop -s <name>` when done** — idle VMs burn compute units. `colab run` (without `--keep`) self-cleans even if the script errors.
+- For persistent workspaces, use `colab-workspace finish` and keep the VM available if saving or flushing fails. For explicitly ephemeral jobs only, retrieve required outputs before `colab stop -s <name>`. Idle VMs consume compute units; `colab run` without `--keep` tears down automatically even on script failure.
 - Local state lives in `~/.config/colab-cli/sessions.json` (settings in `settings.json`, history in `history/*.jsonl`). Don't edit by hand.
 - **Isolate parallel/agent runs** with the global `--config <path>` flag to point session state at a scratch file (e.g. `colab --config /tmp/agent.json new -s job`).
 
 ## Recovery
 - "Session not found" / 404 / 401 on exec: the backend pruned the VM. `colab exec`/`repl` detect this and clean up local state automatically — run `colab sessions` and re-create with `colab new`.
-- Execution timeout or wedged kernel: `colab restart-kernel -s <name>` (keeps the VM, resets the kernel), or `colab stop` then `colab new`.
+- Execution timeout or wedged kernel: inspect status/log first. A kernel restart resets in-memory state; preserve recoverable results before restarting. For persistent jobs, recover save/finish before release; stop/recreate directly only for disposable jobs after retrieving required outputs.

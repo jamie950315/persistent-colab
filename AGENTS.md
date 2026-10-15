@@ -12,7 +12,8 @@ This does not keep a VM or live process alive.
 - `tests/`: integrity and compatibility checks for environment snapshots.
 - `colab_workspace_cli.py` and `pyproject.toml`: installed `colab-workspace`
   companion using the official `colab` executable as its transport.
-- `skills/`: persistent-workspace skill and the official CLI's bundled skill.
+- `skills/colab/`: unified Colab skill with persistence and attributed official
+  CLI references; the only installed Colab skill entrypoint.
 
 ## Operation
 - The private Drive deployment in `My Drive/PersistentColab` was updated in place
@@ -98,7 +99,8 @@ This does not keep a VM or live process alive.
   remain separate from new workspace conflicts.
 - Public repository: `https://github.com/jamie950315/persistent-colab`, branch `main`.
 - Install from a local checkout with `uv tool install --editable .`.
-  Installed skill directories in `~/.codex/skills` link to the tracked `skills/`.
+  Installed `colab` skill entries in `~/.codex/skills` and `~/.claude/skills`
+  link to tracked `skills/colab/`; retire old operator/persistence symlinks.
 - The installed companion was tested on a real CPU VM through official CLI
   0.7.4: Drive mount, existing snapshot restore, script execution/arguments,
   exit-code propagation, package installation, status, and save/flush/stop.

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Colab"
+  short_description: "Run Colab jobs and restore durable Drive environments"
+  default_prompt: "Use $colab to run my task on Colab, restore its workspace, and save results before releasing the VM."

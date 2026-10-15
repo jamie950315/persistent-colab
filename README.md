@@ -208,27 +208,31 @@ Generate a self-contained notebook locally without allocating a runtime:
 colab-workspace notebook --space research -p training -o training.ipynb
 ```
 
-Existing output files are never overwritten. Skills under `skills/` can be
-installed into `~/.codex/skills` with symlinks: `colab-persistence` describes this
-workflow; `colab-operator` is the installed official CLI's bundled skill with a
-local authentication note. Consult
-live CLI help for current flags because the bundled official skill may describe
-different authentication defaults from the installed release.
+Existing output files are never overwritten. The unified `colab` skill covers
+VM operations and durable workspaces, with detailed references loaded as needed.
+Consult live CLI help for current flags.
 
-From the repository checkout, install the skills with:
+From the repository checkout, install it for Codex and Claude Code with:
 
 ```sh
-python3 - <<'PY'
+python3 - <<'PYINSTALL'
 from pathlib import Path
-destination = Path.home() / '.codex' / 'skills'
-destination.mkdir(parents=True, exist_ok=True)
-for name in ('colab-persistence', 'colab-operator'):
-    (destination / name).symlink_to(Path.cwd() / 'skills' / name, target_is_directory=True)
-PY
+source = Path.cwd() / 'skills' / 'colab'
+for client in ('.codex', '.claude'):
+    destination = Path.home() / client / 'skills'
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / 'colab').symlink_to(source, target_is_directory=True)
+PYINSTALL
 ```
 
-Keep the checkout available while using these symlinks. Existing skill
-directories are preserved: the installer fails rather than replacing them.
+Keep the checkout available while using these symlinks. Existing entries are
+preserved: the installer fails rather than replacing them. When migrating from
+`colab-operator` and `colab-persistence`, remove only those old installation
+symlinks after installing `colab`; preserve any independently maintained copies.
+Start a new client conversation to refresh skill discovery.
+
+Ask the agent: "Use the colab skill to continue research/training, save the
+workspace and release the VM when finished."
 
 ## Python environment
 

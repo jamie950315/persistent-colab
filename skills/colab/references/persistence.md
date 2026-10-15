@@ -1,8 +1,3 @@
----
-name: colab-persistence
-description: Preserve and restore Python/AI workspaces on Google Drive across Colab VM releases and notebooks, using colab-workspace alongside the official colab CLI. Use for durable packages, system layers, spaces, files, checkpoints, or reusable Colab notebook setup.
----
-
 # Colab persistence
 
 Use `colab-workspace` for durable workspace operations and the official `colab`
